@@ -1,7 +1,7 @@
 // ============================================
 // app.js — Main controller
-// Uses camera's REAL exposure params as global
-// reference. Zone scale shows shutter per zone.
+// Pure luminance calibration: no iOS exposure
+// params needed. User calibrates at known EV.
 // ============================================
 
 import * as Camera from './camera.js';
@@ -9,55 +9,41 @@ import * as LM from './lightmeter.js';
 import * as UI from './ui.js';
 import { getFilm } from './films.js';
 
-// ── Application State ──
+// ── State ──
 const state = {
-  // Camera
-  stream: null,
-  track: null,
-  video: null,
-  sampleCanvas: null,
-  sampleCtx: null,
+  stream: null, track: null, video: null,
+  sampleCanvas: null, sampleCtx: null,
   cameraReady: false,
 
-  // REAL exposure params from camera (updated every frame)
-  cameraExposureTime: null,    // e.g., 1/120
-  cameraISO: null,             // e.g., 200
-
-  // Full frame average luminance
+  // Luminance-based metering (no iOS exposure params needed)
   fullFrameAvgY: 0,
 
   // User settings
-  format: '135',
-  focalMm: 50,
-  filmId: 'hp5',
-  aperture: 8,
-  iso: 400,
-  filterId: 'none',
-  filterStops: 0,
+  format: '135', focalMm: 50, filmId: 'hp5',
+  aperture: 8, iso: 400,
+  filterId: 'none', filterStops: 0,
 
   // Metering points
-  points: [],            // [{ xRatio, yRatio, avgLinearY, avgSRGB }]
-  pointAnalyses: [],     // [{ zoneOffset, relativeEV, luminanceRatio }]
+  points: [],
+  pointAnalyses: [],
 
-  // Zone scale shift (user-controlled via drag)
+  // Zone shift
   shiftStops: 0,
 
   // UI toggles
-  previewEnabled: false,
-  zebraEnabled: true,
+  previewEnabled: false, zebraEnabled: true,
 
-  // Calibration: stores the phone's effective aperture constant.
-  // Default is f/1.8 (typical iPhone main camera).
-  // phoneFNumber = 1.8 means the calibration assumes iPhone f/1.8.
-  phoneFNumber: 1.8,
+  // CALIBRATION: stores fullFrameAvgY at known reference EV
   calibrated: false,
+  refEV: 15,
+  refLuminance: null,   // fullFrameAvgY at calibration
   calibrationDate: null,
 
-  // Metering loop
   meteringInterval: null,
+  _lastRefShutter: null,
 };
 
-// ── DOM refs ──
+// ── DOM ──
 const dom = {
   viewfinder: document.getElementById('viewfinder'),
   cameraPreview: document.getElementById('camera-preview'),
@@ -78,18 +64,13 @@ async function init() {
 
   try { await startCamera(); }
   catch (err) {
-    console.error('Camera failed:', err);
     document.getElementById('viewfinder-hint').textContent = '摄像头不可用: ' + err.message;
-    // Continue anyway — UI works without camera
+    return;
   }
 
   loadCalibration();
   applyFilmSelection();
-
-  // Show initial shutter tape immediately
-  const initRef = computeReferenceShutter();
-  UI.renderShutterTape(initRef);
-
+  UI.renderShutterTape(computeReferenceShutter());
   startMeteringLoop();
   UI.drawFrameLines(dom.frameLines, state.format, state.focalMm);
   registerSW();
@@ -101,48 +82,51 @@ async function startCamera() {
   state.stream = cam.stream;
   state.track = cam.track;
   state.video = cam.video;
-  state.cameraExposureTime = cam.exposureTime;
-  state.cameraISO = cam.iso;
   const { canvas, ctx } = Camera.createSamplingCanvas(320, 240);
   state.sampleCanvas = canvas;
   state.sampleCtx = ctx;
   state.cameraReady = true;
 
-  // Log full settings + show on screen for iOS debug
-  console.log('Camera ready:', {
-    exposureTime: cam.exposureTime,
-    iso: cam.iso,
-    label: cam.track.label,
-    keys: cam.allKeys,
-    dump: cam.settingsDump,
-  });
-
-  if (cam.exposureTime) {
-    UI.showViewfinderHint('✓ 曝光参数已读取 · 点击画面测光', 2500);
-  } else {
-    UI.showViewfinderHint('⚠ 无法读取曝光参数（iOS限制）· 使用估算值', 3000);
-  }
+  UI.showViewfinderHint('✓ 摄像头就绪 · 晴天请先校准 ⚙', 3000);
 }
 
-// ── Metering loop (5 Hz) ──
+// ── Reference shutter (pure luminance, calibration-based) ──
+
+function computeReferenceShutter() {
+  // Without calibration: use Sunny 16 estimate
+  if (!state.calibrated || !state.refLuminance || state.refLuminance <= 0) {
+    return sunny16Estimate();
+  }
+
+  // With calibration: compare current luminance to reference
+  if (state.fullFrameAvgY <= 0) return sunny16Estimate();
+
+  // relativeEV measures how many stops the current scene differs from calibration
+  const ratio = state.fullFrameAvgY / state.refLuminance;
+  const relativeEV = Math.log2(Math.max(0.001, Math.min(1000, ratio)));
+  const sceneEV = state.refEV + relativeEV;
+
+  // Shutter for Zone V at this EV
+  return (state.aperture * state.aperture) / (Math.pow(2, sceneEV) * state.iso / 100);
+}
+
+function sunny16Estimate() {
+  const isoRel = state.iso / 100;
+  return (state.aperture * state.aperture) / (32768 * isoRel);
+}
+
+// ── Metering loop ──
 function startMeteringLoop() {
   state.meteringInterval = setInterval(() => {
-    // Camera-dependent operations (skip if no camera)
     if (state.cameraReady) {
-      const params = Camera.readExposureParams(state.track);
-      if (params.exposureTime) state.cameraExposureTime = params.exposureTime;
-      if (params.iso) state.cameraISO = params.iso;
-
       const fullFrame = Camera.sampleFullFrame(state.video, state.sampleCtx, state.sampleCanvas);
       state.fullFrameAvgY = fullFrame.avgLinearY;
 
       for (const pt of state.points) {
         const w = state.sampleCanvas.width, h = state.sampleCanvas.height;
         const cx = pt.xRatio * w, cy = pt.yRatio * h;
-        const radius = Math.min(w, h) * 0.04;
-        const r = Camera.sampleRegion(state.video, state.sampleCtx, state.sampleCanvas, cx, cy, radius);
-        pt.avgLinearY = r.avgLinearY;
-        pt.avgSRGB = r.avgSRGB;
+        const r = Camera.sampleRegion(state.video, state.sampleCtx, state.sampleCanvas, cx, cy, Math.min(w, h) * 0.04);
+        pt.avgLinearY = r.avgLinearY; pt.avgSRGB = r.avgSRGB;
       }
 
       if (state.points.length > 0 && state.fullFrameAvgY > 0) {
@@ -152,337 +136,178 @@ function startMeteringLoop() {
       }
     }
 
-    // Always update display (works with or without camera)
     const refShutter = computeReferenceShutter();
-
-    // Shutter tape is fixed; only re-render when refShutter changes
     if (refShutter !== state._lastRefShutter) {
       UI.renderShutterTape(refShutter);
       state._lastRefShutter = refShutter;
     }
-
-    // Tape slides with shiftStops
     UI.updateTapeTranslation(state.shiftStops);
-
-    // Markers are on the tape, positioned by brightness only
     UI.renderZoneScale(dom.zoneMarkers, state.pointAnalyses, state.shiftStops, dom.zoneInfo);
-
     updateMainShutterDisplay(refShutter);
 
-    // Zebra only with camera
-    if (state.cameraReady && state.zebraEnabled && state.points.length > 0) {
-      updateZebra();
-    } else if (!state.cameraReady || !state.zebraEnabled) {
-      UI.clearZebra(dom.zebraCtx, dom.zebraOverlay.width, dom.zebraOverlay.height);
-    }
+    if (state.cameraReady && state.zebraEnabled && state.points.length > 0) updateZebra();
+    else UI.clearZebra(dom.zebraCtx, dom.zebraOverlay.width, dom.zebraOverlay.height);
 
-    if (state.previewEnabled) {
-      UI.updateExposurePreview(dom.cameraPreview, state.shiftStops);
-    }
+    if (state.previewEnabled) UI.updateExposurePreview(dom.cameraPreview, state.shiftStops);
   }, 200);
 }
 
-// ── Reference shutter: camera's AE choice, adjusted for film ──
-
-/**
- * Compute the reference shutter speed (seconds) that places the
- * full-frame average at Zone V, converted to the user's film settings.
- *
- * Camera AE chooses (exposureTime, ISO_phone) for aperture f_phone.
- * We want shutter for user's (aperture, film_ISO).
- *
- * Light per unit area: ∝ t / f² * ISO
- * For same scene luminance:
- *   film_shutter / film_aperture² * film_ISO = phone_shutter / phone_f² * phone_ISO
- *
- * film_shutter = phone_shutter * (film_aperture² / phone_f²) * (phone_ISO / film_ISO)
- *
- * We store phoneFNumber (default 1.8 = iPhone main lens).
- */
-function computeReferenceShutter() {
-  // Use camera exposure params if available.
-  // Without camera, use Sunny 16 reference: EV 15 at ISO 100
-  if (!state.cameraExposureTime || state.cameraExposureTime <= 0) {
-    // Sunny 16: EV = 15 at ISO 100
-    // t = N² / (2^EV * ISO/100) = N² / (2^15 * isoRel)
-    const isoRel = state.iso / 100;
-    return (state.aperture * state.aperture) / (32768 * isoRel);
-  }
-
-  const phoneT = state.cameraExposureTime;
-  const phoneISO = state.cameraISO || 100;
-  const filmISO = state.iso;
-
-  // film_shutter = phoneT * (film_N/phone_N)² * (phoneISO/filmISO)
-  const ratio = state.aperture / state.phoneFNumber;
-  let filmShutter = phoneT * (ratio * ratio) * (phoneISO / filmISO);
-
-  // Clamp to reasonable range
-  filmShutter = Math.max(1 / 32000, Math.min(120, filmShutter));
-
-  return filmShutter;
-}
-
 // ── Main shutter display ──
-
 function updateMainShutterDisplay(refShutter) {
   if (!refShutter || refShutter <= 0) {
-    UI.updateShutterDisplay('--', '等待曝光参数...');
+    UI.updateShutterDisplay('--', '');
     return;
   }
-
-  // Apply user's zone shift: the shutter for Zone V
   const zoneVShutter = refShutter * Math.pow(2, state.shiftStops);
-
-  // Apply filter compensation only (reciprocity removed as requested)
-  const filterStops = state.filterStops;
-  let finalShutter = zoneVShutter * Math.pow(2, filterStops);
-
-  // Round to nearest standard stop (always)
+  let finalShutter = zoneVShutter * Math.pow(2, state.filterStops);
   const rounded = LM.roundToNearest(finalShutter, LM.SHUTTER_SPEEDS);
-  const shutterStr = LM.formatShutter(rounded.value);
 
-  // Build info
   const parts = [];
-  if (state.shiftStops !== 0) {
-    parts.push(`偏移 ${state.shiftStops > 0 ? '+' : ''}${state.shiftStops.toFixed(1)} 档`);
-  }
-  if (filterStops > 0) parts.push(`滤镜 +${filterStops.toFixed(1)} 档`);
-  if (Math.abs(rounded.deltaStops) > 0.03) {
-    parts.push(`靠档 ${rounded.deltaStops > 0 ? '+' : ''}${rounded.deltaStops.toFixed(2)} EV`);
-  }
-  const compStr = parts.join(' · ') || null;
+  if (state.shiftStops !== 0) parts.push(`偏移 ${state.shiftStops > 0 ? '+' : ''}${state.shiftStops.toFixed(1)} 档`);
+  if (state.filterStops > 0) parts.push(`滤镜 +${state.filterStops.toFixed(1)} 档`);
+  if (Math.abs(rounded.deltaStops) > 0.03) parts.push(`靠档 ${rounded.deltaStops > 0 ? '+' : ''}${rounded.deltaStops.toFixed(2)} EV`);
 
-  UI.updateShutterDisplay(shutterStr, compStr || '');
+  UI.updateShutterDisplay(LM.formatShutter(rounded.value), parts.join(' · '));
 }
 
 // ── Zebra ──
-
 function updateZebra() {
   const film = getFilm(state.filmId);
   const filmDR = film ? film.dynamicRange : 10;
-
-  const ctx = state.sampleCtx;
-  const canvas = state.sampleCanvas;
+  const ctx = state.sampleCtx, canvas = state.sampleCanvas;
   ctx.drawImage(state.video, 0, 0, canvas.width, canvas.height);
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
   const vfRect = dom.viewfinder.getBoundingClientRect();
   dom.zebraOverlay.width = vfRect.width;
   dom.zebraOverlay.height = vfRect.height;
-  const zebraCtx = dom.zebraCtx;
-  zebraCtx.clearRect(0, 0, dom.zebraOverlay.width, dom.zebraOverlay.height);
-
+  dom.zebraCtx.clearRect(0, 0, dom.zebraOverlay.width, dom.zebraOverlay.height);
   if (!state.pointAnalyses || state.pointAnalyses.length === 0) return;
 
   const data = imageData.data;
-  const srcW = canvas.width;
-  const srcH = canvas.height;
-  const dstW = dom.zebraOverlay.width;
-  const dstH = dom.zebraOverlay.height;
-  const scaleX = dstW / srcW;
-  const scaleY = dstH / srcH;
-
+  const srcW = canvas.width, srcH = canvas.height;
+  const scaleX = dom.zebraOverlay.width / srcW, scaleY = dom.zebraOverlay.height / srcH;
   const halfDR = filmDR / 2;
-  const thresholdLow = -halfDR + state.shiftStops;
-  const thresholdHigh = halfDR + state.shiftStops;
+  const tLow = -halfDR + state.shiftStops, tHigh = halfDR + state.shiftStops;
 
   for (let sy = 0; sy < srcH; sy += 4) {
     for (let sx = 0; sx < srcW; sx += 4) {
       const idx = (sy * srcW + sx) * 4;
       if (idx >= data.length) continue;
-
-      const r8 = data[idx], g8 = data[idx + 1], b8 = data[idx + 2];
-      const linearY = Camera.srgbToLinear(r8 / 255) * 0.2126
-        + Camera.srgbToLinear(g8 / 255) * 0.7152
-        + Camera.srgbToLinear(b8 / 255) * 0.0722;
-
-      const relativeEV = Math.log2(Math.max(0.001, linearY / Math.max(0.001, state.fullFrameAvgY)));
-
-      if (relativeEV < thresholdLow) {
-        if ((sx + sy) % 8 < 4) {
-          zebraCtx.fillStyle = 'rgba(30, 80, 255, 0.6)';
-          zebraCtx.fillRect(sx * scaleX, sy * scaleY, 4 * scaleX, 4 * scaleY);
-        }
-      } else if (relativeEV > thresholdHigh) {
-        if ((sx - sy) % 8 < 4) {
-          zebraCtx.fillStyle = 'rgba(255, 40, 0, 0.6)';
-          zebraCtx.fillRect(sx * scaleX, sy * scaleY, 4 * scaleX, 4 * scaleY);
-        }
+      const r8 = data[idx], g8 = data[idx+1], b8 = data[idx+2];
+      const linearY = Camera.srgbToLinear(r8/255)*0.2126 + Camera.srgbToLinear(g8/255)*0.7152 + Camera.srgbToLinear(b8/255)*0.0722;
+      const relEV = Math.log2(Math.max(0.001, linearY / Math.max(0.001, state.fullFrameAvgY)));
+      if (relEV < tLow && (sx+sy)%8<4) {
+        dom.zebraCtx.fillStyle = 'rgba(30,80,255,0.6)';
+        dom.zebraCtx.fillRect(sx*scaleX, sy*scaleY, 4*scaleX, 4*scaleY);
+      } else if (relEV > tHigh && (sx-sy)%8<4) {
+        dom.zebraCtx.fillStyle = 'rgba(255,40,0,0.6)';
+        dom.zebraCtx.fillRect(sx*scaleX, sy*scaleY, 4*scaleX, 4*scaleY);
       }
     }
   }
 }
 
-// ── Zone scale dragging ──
-
-/**
- * Compute the allowed range for shiftStops.
- * All metering points must stay within Zone 0 to Zone X after shift.
- */
+// ── Zone drag ──
 function getShiftLimits() {
-  if (!state.pointAnalyses || state.pointAnalyses.length === 0) {
-    return { min: -5, max: 5 };
-  }
-  let minShift = -Infinity;
-  let maxShift = Infinity;
+  if (!state.pointAnalyses || state.pointAnalyses.length === 0) return { min: -5, max: 5 };
+  let minS = -Infinity, maxS = Infinity;
   for (const pt of state.pointAnalyses) {
-    // 0 ≤ 5 + zoneOffset + shift ≤ 10
-    // → -5 - zoneOffset ≤ shift ≤ 5 - zoneOffset
-    const lo = -5 - pt.zoneOffset;
-    const hi = 5 - pt.zoneOffset;
-    minShift = Math.max(minShift, lo);
-    maxShift = Math.min(maxShift, hi);
+    minS = Math.max(minS, -5 - pt.zoneOffset);
+    maxS = Math.min(maxS, 5 - pt.zoneOffset);
   }
-  return { min: minShift, max: maxShift };
+  return { min: minS, max: maxS };
 }
 
-function clampShift(value) {
-  const limits = getShiftLimits();
-  return Math.max(limits.min, Math.min(limits.max, value));
+function clampShift(v) {
+  const lim = getShiftLimits();
+  return Math.max(lim.min, Math.min(lim.max, v));
 }
 
 function bindZoneScaleDrag() {
   const track = dom.zoneTrack;
-  let dragging = false;
-  let startX = 0, startShift = 0;
-
-  function onStart(e) {
+  let dragging = false, startX = 0, startShift = 0;
+  track.addEventListener('pointerdown', e => {
     if (state.points.length === 0) return;
-    dragging = true;
-    startX = e.clientX || (e.touches && e.touches[0].clientX) || 0;
-    startShift = state.shiftStops;
-    track.style.cursor = 'grabbing';
-    e.preventDefault();
-  }
-
-  function onMove(e) {
+    dragging = true; startX = e.clientX || (e.touches&&e.touches[0].clientX)||0;
+    startShift = state.shiftStops; track.style.cursor = 'grabbing'; e.preventDefault();
+  });
+  track.addEventListener('pointermove', e => {
     if (!dragging) return;
-    const clientX = e.clientX || (e.touches && e.touches[0].clientX) || 0;
-    const deltaX = clientX - startX;
-    const trackW = track.getBoundingClientRect().width;
-    const stopsPerPixel = 10 / trackW;
-    state.shiftStops = clampShift(startShift + deltaX * stopsPerPixel);
-  }
-
-  function onEnd() {
-    dragging = false;
-    track.style.cursor = state.points.length > 0 ? 'grab' : '';
-  }
-
-  track.addEventListener('pointerdown', onStart);
-  track.addEventListener('pointermove', onMove);
-  track.addEventListener('pointerup', onEnd);
-  track.addEventListener('pointerleave', onEnd);
-  track.addEventListener('pointercancel', onEnd);
-  track.addEventListener('touchstart', (e) => {
-    if (state.points.length > 0) e.preventDefault();
-  }, { passive: false });
+    const cx = e.clientX || (e.touches&&e.touches[0].clientX)||0;
+    const stopsPerPixel = 10 / track.getBoundingClientRect().width;
+    state.shiftStops = clampShift(startShift + (cx - startX) * stopsPerPixel);
+  });
+  const end = () => { dragging = false; track.style.cursor = state.points.length>0?'grab':''; };
+  track.addEventListener('pointerup', end);
+  track.addEventListener('pointerleave', end);
+  track.addEventListener('pointercancel', end);
+  track.addEventListener('touchstart', e => { if(state.points.length>0)e.preventDefault(); }, {passive:false});
 }
 
-// ── Viewfinder tap → metering point ──
-
+// ── Viewfinder tap ──
 function bindViewfinderTap() {
-  dom.viewfinder.addEventListener('click', (e) => {
+  dom.viewfinder.addEventListener('click', e => {
     if (e.target.closest('.metering-point')) return;
-
     const rect = dom.viewfinder.getBoundingClientRect();
-    const xRatio = (e.clientX - rect.left) / rect.width;
-    const yRatio = (e.clientY - rect.top) / rect.height;
+    const xr = (e.clientX - rect.left) / rect.width;
+    const yr = (e.clientY - rect.top) / rect.height;
 
-    const sampleW = state.sampleCanvas.width;
-    const sampleH = state.sampleCanvas.height;
-    const cx = xRatio * sampleW;
-    const cy = yRatio * sampleH;
-    const radius = Math.min(sampleW, sampleH) * 0.04;
-    const sample = Camera.sampleRegion(state.video, state.sampleCtx, state.sampleCanvas, cx, cy, radius);
-
-    const point = { xRatio, yRatio, avgLinearY: sample.avgLinearY, avgSRGB: sample.avgSRGB };
-    state.points.push(point);
+    const sw = state.sampleCanvas.width, sh = state.sampleCanvas.height;
+    const sample = Camera.sampleRegion(state.video, state.sampleCtx, state.sampleCanvas, xr*sw, yr*sh, Math.min(sw,sh)*0.04);
+    const pt = { xRatio: xr, yRatio: yr, avgLinearY: sample.avgLinearY, avgSRGB: sample.avgSRGB };
+    state.points.push(pt);
     const idx = state.points.length - 1;
-    UI.addMeteringPoint(dom.meteringPoints, xRatio, yRatio, idx);
+    UI.addMeteringPoint(dom.meteringPoints, xr, yr, idx);
 
-    if (state.fullFrameAvgY > 0) {
-      state.pointAnalyses = LM.analyzePoints(state.points, state.fullFrameAvgY);
-    }
-
-    UI.showViewfinderHint(`P${idx + 1} 已添加 · ${state.points.length} 个测光点`, 2000);
-
-    // First point: auto-center it on Zone V (within limits)
-    if (state.points.length === 1 && state.pointAnalyses.length > 0) {
+    if (state.fullFrameAvgY > 0) state.pointAnalyses = LM.analyzePoints(state.points, state.fullFrameAvgY);
+    if (state.points.length === 1 && state.pointAnalyses.length > 0)
       state.shiftStops = clampShift(-state.pointAnalyses[0].zoneOffset);
-    }
+
+    UI.showViewfinderHint(`P${idx+1} 已添加 · ${state.points.length} 点`, 2000);
   });
 
-  // Long press → remove point
-  dom.meteringPoints.addEventListener('longpress', (e) => {
-    const wrapper = e.target.closest('.metering-point');
-    if (!wrapper) return;
-    const index = parseInt(wrapper.dataset.index);
-    if (isNaN(index) || index < 0 || index >= state.points.length) return;
-
-    state.points.splice(index, 1);
-    UI.removeMeteringPoint(dom.meteringPoints, wrapper);
-
-    const allMarkers = dom.meteringPoints.querySelectorAll('.metering-point');
-    allMarkers.forEach((m, i) => {
-      m.dataset.index = i;
-      const label = m.querySelector('.metering-point-label');
-      if (label) label.textContent = 'P' + (i + 1);
-    });
-
-    if (state.points.length > 0 && state.fullFrameAvgY > 0) {
-      state.pointAnalyses = LM.analyzePoints(state.points, state.fullFrameAvgY);
-      state.shiftStops = clampShift(state.shiftStops);
-    } else {
-      state.pointAnalyses = [];
-      state.shiftStops = 0;
-    }
-    UI.showViewfinderHint(`已删除 · 剩 ${state.points.length} 点`, 1500);
+  dom.meteringPoints.addEventListener('longpress', e => {
+    const w = e.target.closest('.metering-point');
+    if (!w) return;
+    const idx = parseInt(w.dataset.index);
+    if (isNaN(idx)||idx<0||idx>=state.points.length) return;
+    state.points.splice(idx,1);
+    UI.removeMeteringPoint(dom.meteringPoints, w);
+    dom.meteringPoints.querySelectorAll('.metering-point').forEach((m,i)=>{m.dataset.index=i;const l=m.querySelector('.metering-point-label');if(l)l.textContent='P'+(i+1);});
+    if (state.points.length>0&&state.fullFrameAvgY>0){state.pointAnalyses=LM.analyzePoints(state.points,state.fullFrameAvgY);state.shiftStops=clampShift(state.shiftStops);}
+    else{state.pointAnalyses=[];state.shiftStops=0;}
+    UI.showViewfinderHint(`已删除 · 剩${state.points.length}点`,1500);
   });
 }
 
-// ── Button handlers ──
-
+// ── Buttons ──
 function bindButtonEvents() {
   document.getElementById('btn-preview').addEventListener('click', () => {
     state.previewEnabled = !state.previewEnabled;
     document.getElementById('btn-preview').classList.toggle('active', state.previewEnabled);
     if (!state.previewEnabled) UI.clearExposurePreview(dom.cameraPreview);
   });
-
   document.getElementById('btn-zebra').addEventListener('click', () => {
     state.zebraEnabled = !state.zebraEnabled;
     document.getElementById('btn-zebra').classList.toggle('active', state.zebraEnabled);
     if (!state.zebraEnabled) UI.clearZebra(dom.zebraCtx, dom.zebraOverlay.width, dom.zebraOverlay.height);
   });
-
   document.getElementById('btn-clear').addEventListener('click', () => {
-    state.points = [];
-    state.pointAnalyses = [];
-    state.shiftStops = clampShift(0);
+    state.points = []; state.pointAnalyses = []; state.shiftStops = clampShift(0);
     UI.clearMeteringPoints(dom.meteringPoints);
     UI.clearZebra(dom.zebraCtx, dom.zebraOverlay.width, dom.zebraOverlay.height);
     UI.clearZoneScale(dom.zoneMarkers, dom.zoneInfo);
     UI.clearTapeTranslation();
     UI.updateShutterDisplay('--', '');
-    UI.showViewfinderHint('已清除所有测光点', 1500);
   });
-
   document.getElementById('btn-undo').addEventListener('click', () => {
     if (state.points.length === 0) return;
-    const removedIndex = state.points.length - 1;
     state.points.pop();
-    const marker = dom.meteringPoints.querySelector(`.metering-point[data-index="${removedIndex}"]`);
-    if (marker) marker.remove();
-    if (state.points.length > 0 && state.fullFrameAvgY > 0) {
-      state.pointAnalyses = LM.analyzePoints(state.points, state.fullFrameAvgY);
-      state.shiftStops = clampShift(state.shiftStops);
-    } else {
-      state.pointAnalyses = [];
-      state.shiftStops = 0;
-    }
-    UI.showViewfinderHint('已撤销 · 剩 ' + state.points.length + ' 点', 1500);
+    const m = dom.meteringPoints.querySelector(`.metering-point[data-index="${state.points.length}"]`);
+    if (m) m.remove();
+    if (state.points.length>0&&state.fullFrameAvgY>0){state.pointAnalyses=LM.analyzePoints(state.points,state.fullFrameAvgY);state.shiftStops=clampShift(state.shiftStops);}
+    else{state.pointAnalyses=[];state.shiftStops=0;}
+    UI.showViewfinderHint('已撤销 · 剩'+state.points.length+'点',1500);
   });
 
   // Calibration
@@ -499,153 +324,93 @@ function bindButtonEvents() {
   });
   document.getElementById('btn-cal-manual-do').addEventListener('click', () => {
     const ev = parseFloat(document.getElementById('input-ref-ev').value);
-    if (!isNaN(ev) && ev >= -10 && ev <= 25) doCalibrate(ev);
+    if (!isNaN(ev)) doCalibrate(ev);
   });
 }
 
-// ── Settings change handlers ──
-
+// ── Settings ──
 function bindSettingsEvents() {
-  document.getElementById('select-format').addEventListener('change', (e) => {
-    state.format = e.target.value;
-    UI.drawFrameLines(dom.frameLines, state.format, state.focalMm);
-  });
-
-  document.getElementById('select-focal').addEventListener('change', (e) => {
-    state.focalMm = parseInt(e.target.value);
-    UI.drawFrameLines(dom.frameLines, state.format, state.focalMm);
-  });
-
-  document.getElementById('select-film').addEventListener('change', (e) => {
-    state.filmId = e.target.value;
-    applyFilmSelection();
-  });
-
-  document.getElementById('select-aperture').addEventListener('change', (e) => {
-    state.aperture = parseFloat(e.target.value);
-  });
-
-  document.getElementById('input-iso').addEventListener('change', (e) => {
-    const v = parseInt(e.target.value);
-    if (!isNaN(v) && v >= 6 && v <= 25600) state.iso = v;
-  });
-
-  document.getElementById('select-filter').addEventListener('change', (e) => {
+  document.getElementById('select-format').addEventListener('change', e => { state.format = e.target.value; UI.drawFrameLines(dom.frameLines, state.format, state.focalMm); });
+  document.getElementById('select-focal').addEventListener('change', e => { state.focalMm = parseInt(e.target.value); UI.drawFrameLines(dom.frameLines, state.format, state.focalMm); });
+  document.getElementById('select-film').addEventListener('change', e => { state.filmId = e.target.value; applyFilmSelection(); });
+  document.getElementById('select-aperture').addEventListener('change', e => { state.aperture = parseFloat(e.target.value); });
+  document.getElementById('input-iso').addEventListener('change', e => { const v=parseInt(e.target.value); if(!isNaN(v)&&v>=6&&v<=25600)state.iso=v; });
+  document.getElementById('select-filter').addEventListener('change', e => {
     state.filterId = e.target.value;
-    const filter = LM.FILTERS.find(f => f.id === e.target.value);
-    state.filterStops = filter ? filter.stops : 0;
+    const f = LM.FILTERS.find(ff => ff.id === e.target.value);
+    state.filterStops = f ? f.stops : 0;
   });
 }
 
 function applyFilmSelection() {
   const film = getFilm(state.filmId);
-  if (film) {
-    state.iso = film.iso;
-    document.getElementById('input-iso').value = film.iso;
-  }
+  if (film) { state.iso = film.iso; document.getElementById('input-iso').value = film.iso; }
 }
 
-// ── Calibration ──
-
-/**
- * Calibrate: user provides reference EV (e.g., 15 for Sunny 16).
- * We solve for the phone's effective f-number:
- *   phone_F² = phone_exposureTime * phone_ISO * 2^EV_ref / 100
- */
+// ── Calibration (pixel luminance only) ──
 function doCalibrate(refEV) {
-  if (!state.cameraExposureTime) {
-    alert('无法读取摄像头曝光参数。请确保已授权摄像头访问。');
+  if (!state.cameraReady || state.fullFrameAvgY <= 0) {
+    alert('请确保摄像头画面正常后再校准。');
     return;
   }
 
-  const N = state.aperture;
-  const filmISO = state.iso;
-  const tCam = state.cameraExposureTime;
-  const isoCam = state.cameraISO || 100;
-
-  // Formula: film_shutter = phoneT * (film_N/phone_N)² * (phoneISO/filmISO)
-  // At calibration: film_shutter should = N² / (2^EV_ref * ISO_film/100)
-  // Solve for phone_N:
-  //   phone_N² = phoneT * phoneISO * 2^EV_ref / 100
-  const phoneNSq = tCam * isoCam * Math.pow(2, refEV) / 100;
-  const phoneF = Math.sqrt(phoneNSq);
-
-  if (phoneF <= 0.5 || phoneF > 32) {
-    alert(`校准异常 (phone_f=${phoneF.toFixed(2)})。请确认:\n- 光圈: f/${N}\n- ISO: ${filmISO}\n- 参考EV: ${refEV}\n- 摄像头快门: ${LM.formatShutter(tCam)}`);
-    return;
-  }
-
-  state.phoneFNumber = phoneF;
+  // Store: at this EV, the camera produced this average luminance
+  state.refEV = refEV;
+  state.refLuminance = state.fullFrameAvgY;
   state.calibrated = true;
   state.calibrationDate = new Date().toISOString();
+
+  // Compute expected shutter for confirmation
+  const expectedShutter = (state.aperture * state.aperture) / (Math.pow(2, refEV) * state.iso / 100);
+  const rounded = LM.roundToNearest(expectedShutter, LM.SHUTTER_SPEEDS);
 
   saveCalibration();
   updateCalibrationUI();
   document.getElementById('calibration-modal').classList.add('hidden');
 
-  const tUser = (N * N) / (Math.pow(2, refEV) * (filmISO / 100));
-  UI.showViewfinderHint(
-    `校准完成: EV ${refEV} · 手机光圈 f/${phoneF.toFixed(1)} · 参考快门 ${LM.formatShutter(tUser)}`,
-    4000
-  );
+  UI.showViewfinderHint(`✓ 校准完成: EV${refEV} · 基线 Y=${state.refLuminance.toFixed(4)} · 参考快门 ${LM.formatShutter(rounded.value)}`, 5000);
 }
 
 function saveCalibration() {
-  try {
-    localStorage.setItem('lightmeter_cal3', JSON.stringify({
-      phoneFNumber: state.phoneFNumber,
-      date: state.calibrationDate,
-    }));
-  } catch (e) { /* ignore */ }
+  try { localStorage.setItem('lightmeter_lumcal', JSON.stringify({ refEV: state.refEV, refLuminance: state.refLuminance, date: state.calibrationDate })); } catch(e){}
 }
 
 function loadCalibration() {
   try {
-    const raw = localStorage.getItem('lightmeter_cal3');
+    const raw = localStorage.getItem('lightmeter_lumcal');
     if (raw) {
       const data = JSON.parse(raw);
-      if (data.phoneFNumber) state.phoneFNumber = data.phoneFNumber;
-      state.calibrated = true;
+      state.refEV = data.refEV || 15;
+      state.refLuminance = data.refLuminance || null;
+      state.calibrated = !!(data.refLuminance);
       state.calibrationDate = data.date;
     }
-  } catch (e) { /* ignore */ }
+  } catch(e){}
 }
 
 function updateCalibrationUI() {
   const el = document.getElementById('calibration-status');
   if (state.calibrated) {
-    el.textContent = `已校准 · 手机光圈 f/${state.phoneFNumber.toFixed(1)} · ${state.calibrationDate || ''}`;
+    el.textContent = `已校准: EV${state.refEV} · Y=${state.refLuminance?.toFixed(4)} · ${state.calibrationDate||''}`;
   } else {
-    el.textContent = `尚未校准（默认手机光圈 f/${state.phoneFNumber.toFixed(1)}）`;
+    el.textContent = '尚未校准。晴天户外对准中灰场景（草地/水泥地），点「立即校准」。';
   }
 }
 
-// ── Service Worker ──
-
+// ── SW ──
 function registerSW() {
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
-  }
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(()=>{});
 }
-
-// ── Bind all events ──
 
 function bindEvents() {
   bindZoneScaleDrag();
   bindViewfinderTap();
   bindButtonEvents();
   bindSettingsEvents();
-
-  window.addEventListener('resize', () => {
-    UI.drawFrameLines(dom.frameLines, state.format, state.focalMm);
-  });
-  window.addEventListener('orientationchange', () => {
-    setTimeout(() => UI.drawFrameLines(dom.frameLines, state.format, state.focalMm), 300);
-  });
+  window.addEventListener('resize', () => UI.drawFrameLines(dom.frameLines, state.format, state.focalMm));
+  window.addEventListener('orientationchange', () => setTimeout(() => UI.drawFrameLines(dom.frameLines, state.format, state.focalMm), 300));
 }
 
-// ── Start ──
 init().catch(err => {
-  console.error('Init error:', err);
   document.getElementById('viewfinder-hint').textContent = '初始化失败: ' + err.message;
 });
