@@ -4,8 +4,8 @@
 // ============================================
 
 /**
- * Initialize the rear camera and return the stream + video element.
- * Reads real exposure params (exposureTime, ISO) from MediaTrackSettings.
+ * Initialize the rear camera.
+ * Polls getSettings() to capture iOS exposure params.
  */
 export async function initCamera(videoElement) {
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -22,21 +22,43 @@ export async function initCamera(videoElement) {
   await videoElement.play();
 
   const track = stream.getVideoTracks()[0];
-  const settings = track.getSettings();
+
+  // Poll settings — iOS may take a moment to populate exposure params
+  let settings = track.getSettings();
+  let bestExposureTime = settings.exposureTime ?? null;
+  let bestISO = settings.iso ?? null;
+
+  // Poll a few times
+  for (let i = 0; i < 5; i++) {
+    await new Promise(r => setTimeout(r, 300));
+    settings = track.getSettings();
+    if (!bestExposureTime && settings.exposureTime) {
+      bestExposureTime = settings.exposureTime;
+    }
+    if (!bestISO && settings.iso) {
+      bestISO = settings.iso;
+    }
+  }
+
+  // Dump all setting keys for debugging
+  const allKeys = Object.keys(settings);
+  const settingsDump = {};
+  allKeys.forEach(k => { settingsDump[k] = settings[k]; });
 
   return {
     stream,
     track,
     video: videoElement,
     settings,
-    exposureTime: settings.exposureTime ?? null,
-    iso: settings.iso ?? null,
+    settingsDump: JSON.stringify(settingsDump, null, 2),
+    allKeys: allKeys.join(', '),
+    exposureTime: bestExposureTime,
+    iso: bestISO,
   };
 }
 
 /**
  * Create an offscreen canvas for frame sampling.
- * Returns the canvas + 2D context.
  */
 export function createSamplingCanvas(width = 160, height = 120) {
   const canvas = document.createElement('canvas');
@@ -48,18 +70,11 @@ export function createSamplingCanvas(width = 160, height = 120) {
 
 /**
  * Sample a circular region from the current video frame.
- * Returns { avgLinearY, avgSRGB } representing the region's luminance.
- * - avgLinearY: average in linear space (0-1), used for EV calculations
- * - avgSRGB: average 8-bit sRGB value (0-255), for display
  */
 export function sampleRegion(video, ctx, canvas, cx, cy, radius) {
-  // Draw current frame (downscaled)
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  const w = canvas.width;
-  const h = canvas.height;
-
-  // Define sampling bounds within the canvas
+  const w = canvas.width, h = canvas.height;
   const x0 = Math.max(0, Math.floor(cx - radius));
   const y0 = Math.max(0, Math.floor(cy - radius));
   const x1 = Math.min(w, Math.ceil(cx + radius));
@@ -70,27 +85,15 @@ export function sampleRegion(video, ctx, canvas, cx, cy, radius) {
   const imageData = ctx.getImageData(x0, y0, x1 - x0, y1 - y0);
   const data = imageData.data;
 
-  let totalLinearY = 0;
-  let totalSRGB = 0;
-  let count = 0;
+  let totalLinearY = 0, totalSRGB = 0, count = 0;
 
   for (let i = 0; i < data.length; i += 4) {
-    const r8 = data[i];
-    const g8 = data[i + 1];
-    const b8 = data[i + 2];
-
-    // Linearize sRGB
+    const r8 = data[i], g8 = data[i + 1], b8 = data[i + 2];
     const r = srgbToLinear(r8 / 255);
     const g = srgbToLinear(g8 / 255);
     const b = srgbToLinear(b8 / 255);
-
-    // BT.709 relative luminance
-    const Y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    totalLinearY += Y;
-
-    // Simple sRGB luminance approximation for display
+    totalLinearY += 0.2126 * r + 0.7152 * g + 0.0722 * b;
     totalSRGB += 0.2126 * r8 + 0.7152 * g8 + 0.0722 * b8;
-
     count++;
   }
 
@@ -102,30 +105,20 @@ export function sampleRegion(video, ctx, canvas, cx, cy, radius) {
 
 /**
  * Sample the full frame average luminance.
- * Used as the reference point for the camera's auto-exposure target.
  */
 export function sampleFullFrame(video, ctx, canvas) {
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = imageData.data;
 
-  let totalLinearY = 0;
-  let totalSRGB = 0;
-  const pixelCount = data.length / 4;
-
-  // Sample at stride for performance (every 2nd pixel)
+  let totalLinearY = 0, totalSRGB = 0, sampled = 0;
   const stride = 2;
-  let sampled = 0;
 
   for (let i = 0; i < data.length; i += 4 * stride) {
-    const r8 = data[i];
-    const g8 = data[i + 1];
-    const b8 = data[i + 2];
-
+    const r8 = data[i], g8 = data[i + 1], b8 = data[i + 2];
     const r = srgbToLinear(r8 / 255);
     const g = srgbToLinear(g8 / 255);
     const b = srgbToLinear(b8 / 255);
-
     totalLinearY += 0.2126 * r + 0.7152 * g + 0.0722 * b;
     totalSRGB += 0.2126 * r8 + 0.7152 * g8 + 0.0722 * b8;
     sampled++;
@@ -137,27 +130,16 @@ export function sampleFullFrame(video, ctx, canvas) {
   };
 }
 
-/**
- * Convert 8-bit sRGB component to linear space.
- * Uses the sRGB piecewise transfer function (IEC 61966-2-1).
- */
 export function srgbToLinear(c) {
   if (c <= 0.04045) return c / 12.92;
   return Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
-/**
- * Convert linear value back to sRGB for display.
- */
 export function linearToSRGB(c) {
   if (c <= 0.0031308) return c * 12.92;
   return 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
 }
 
-/**
- * Read current exposure parameters from the camera track.
- * Returns { exposureTime, iso } or nulls if unavailable.
- */
 export function readExposureParams(track) {
   const settings = track.getSettings();
   return {
@@ -166,28 +148,14 @@ export function readExposureParams(track) {
   };
 }
 
-/**
- * Check if the browser supports reading exposure settings.
- * iOS Safari 16+ supports this.
- */
 export function supportsExposureParams() {
-  return 'mediaDevices' in navigator
-    && 'getUserMedia' in navigator.mediaDevices;
+  return 'mediaDevices' in navigator && 'getUserMedia' in navigator.mediaDevices;
 }
 
-/**
- * Stop the camera stream and release resources.
- */
 export function stopCamera(stream) {
-  if (stream) {
-    stream.getTracks().forEach(t => t.stop());
-  }
+  if (stream) stream.getTracks().forEach(t => t.stop());
 }
 
-/**
- * Get the device's camera capabilities for display.
- * Useful for showing what the camera reports.
- */
 export function getCameraInfo(track) {
   const caps = track.getCapabilities ? track.getCapabilities() : {};
   const settings = track.getSettings();
@@ -195,11 +163,7 @@ export function getCameraInfo(track) {
     label: track.label || 'Unknown',
     exposureTime: settings.exposureTime,
     iso: settings.iso,
-    exposureTimeRange: caps.exposureTime
-      ? { min: caps.exposureTime.min, max: caps.exposureTime.max }
-      : null,
-    isoRange: caps.iso
-      ? { min: caps.iso.min, max: caps.iso.max }
-      : null,
+    exposureTimeRange: caps.exposureTime ? { min: caps.exposureTime.min, max: caps.exposureTime.max } : null,
+    isoRange: caps.iso ? { min: caps.iso.min, max: caps.iso.max } : null,
   };
 }
