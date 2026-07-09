@@ -108,16 +108,21 @@ async function startCamera() {
   state.sampleCtx = ctx;
   state.cameraReady = true;
 
-  console.log('Camera:', {
+  // Log full settings to debug iOS availability
+  const settings = cam.track.getSettings();
+  console.log('Camera ready:', {
     exposureTime: cam.exposureTime,
     iso: cam.iso,
     label: cam.track.label,
+    allSettings: settings,
   });
 
   if (cam.exposureTime) {
-    UI.showViewfinderHint('曝光参数已读取 ✓ · 点击画面测光', 2500);
+    UI.showViewfinderHint('✓ 已读取曝光参数 · 点击画面测光', 2500);
   } else {
-    UI.showViewfinderHint('未读到曝光参数 · 请先校准 ⚙', 0);
+    // iOS may not expose exposureTime via getSettings()
+    // App still works with Sunny 16 estimate; calibration improves accuracy
+    UI.showViewfinderHint('⚠ 曝光参数不可用（iOS限制）· 建议校准 ⚙', 4000);
   }
 }
 
