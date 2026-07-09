@@ -118,15 +118,9 @@ async function startCamera() {
   });
 
   if (cam.exposureTime) {
-    UI.showViewfinderHint(`✓ 曝光: 1/${Math.round(1/cam.exposureTime)}s ISO${cam.iso}`, 3000);
-    document.getElementById('shutter-comp').textContent =
-      `📷 1/${Math.round(1/cam.exposureTime)}s ISO${cam.iso}`;
+    UI.showViewfinderHint('✓ 曝光参数已读取 · 点击画面测光', 2500);
   } else {
-    // Show debug info prominently
-    const debugMsg = `iOS keys: ${cam.allKeys || '(none)'}`;
-    document.getElementById('shutter-value').textContent = '⚠';
-    document.getElementById('shutter-comp').textContent = debugMsg;
-    UI.showViewfinderHint(debugMsg, 0);
+    UI.showViewfinderHint('⚠ 无法读取曝光参数（iOS限制）· 使用估算值', 3000);
   }
 }
 

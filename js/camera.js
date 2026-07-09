@@ -40,18 +40,11 @@ export async function initCamera(videoElement) {
     }
   }
 
-  // Dump all setting keys for debugging
-  const allKeys = Object.keys(settings);
-  const settingsDump = {};
-  allKeys.forEach(k => { settingsDump[k] = settings[k]; });
-
   return {
     stream,
     track,
     video: videoElement,
     settings,
-    settingsDump: JSON.stringify(settingsDump, null, 2),
-    allKeys: allKeys.join(', '),
     exposureTime: bestExposureTime,
     iso: bestISO,
   };
