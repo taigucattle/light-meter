@@ -5,7 +5,8 @@
 
 /**
  * Initialize the rear camera.
- * Polls getSettings() to capture iOS exposure params.
+ * Tries ImageCapture API first, then MediaTrackSettings,
+ * to read real exposureTime and ISO.
  */
 export async function initCamera(videoElement) {
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -23,30 +24,47 @@ export async function initCamera(videoElement) {
 
   const track = stream.getVideoTracks()[0];
 
-  // Poll settings — iOS may take a moment to populate exposure params
-  let settings = track.getSettings();
-  let bestExposureTime = settings.exposureTime ?? null;
-  let bestISO = settings.iso ?? null;
+  // Method 1: ImageCapture.getPhotoSettings() — iOS may support this
+  let exposureTime = null;
+  let iso = null;
+  let method = 'none';
 
-  // Poll a few times
-  for (let i = 0; i < 5; i++) {
-    await new Promise(r => setTimeout(r, 300));
-    settings = track.getSettings();
-    if (!bestExposureTime && settings.exposureTime) {
-      bestExposureTime = settings.exposureTime;
+  if (typeof ImageCapture !== 'undefined') {
+    try {
+      const capturer = new ImageCapture(track);
+      const photoSettings = await capturer.getPhotoSettings();
+      if (photoSettings) {
+        exposureTime = photoSettings.exposureTime ?? null;
+        iso = photoSettings.iso ?? null;
+        if (exposureTime) method = 'ImageCapture';
+      }
+    } catch (e) {
+      // ImageCapture not supported or threw
     }
-    if (!bestISO && settings.iso) {
-      bestISO = settings.iso;
+  }
+
+  // Method 2: MediaStreamTrack.getSettings() with polling
+  if (!exposureTime) {
+    let settings = track.getSettings();
+    exposureTime = settings.exposureTime ?? null;
+    iso = settings.iso ?? null;
+
+    for (let i = 0; i < 5 && !exposureTime; i++) {
+      await new Promise(r => setTimeout(r, 300));
+      settings = track.getSettings();
+      exposureTime = settings.exposureTime ?? null;
+      iso = settings.iso ?? null;
     }
+    if (exposureTime) method = 'getSettings';
   }
 
   return {
     stream,
     track,
     video: videoElement,
-    settings,
-    exposureTime: bestExposureTime,
-    iso: bestISO,
+    exposureTime,
+    iso,
+    method,
   };
 }
 
