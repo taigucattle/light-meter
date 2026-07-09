@@ -119,13 +119,14 @@ async function startCamera() {
 
   if (cam.exposureTime) {
     UI.showViewfinderHint(`✓ 曝光: 1/${Math.round(1/cam.exposureTime)}s ISO${cam.iso}`, 3000);
-    document.getElementById('zone-info').textContent =
-      `📷 已读: 1/${Math.round(1/cam.exposureTime)}s ISO${cam.iso}`;
+    document.getElementById('shutter-comp').textContent =
+      `📷 1/${Math.round(1/cam.exposureTime)}s ISO${cam.iso}`;
   } else {
-    // Show what keys iOS actually returned
-    document.getElementById('zone-info').textContent =
-      `⚠ iOS返回属性: ${cam.allKeys || '无'} · 请截图发我`;
-    UI.showViewfinderHint('⚠ 曝光参数未读取 · 查看底部调试信息', 0);
+    // Show debug info prominently
+    const debugMsg = `iOS keys: ${cam.allKeys || '(none)'}`;
+    document.getElementById('shutter-value').textContent = '⚠';
+    document.getElementById('shutter-comp').textContent = debugMsg;
+    UI.showViewfinderHint(debugMsg, 0);
   }
 }
 

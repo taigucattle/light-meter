@@ -424,10 +424,11 @@ body {
 }
 
 #zone-info {
-  font-size: 10px;
-  color: var(--text-hint);
+  font-size: 12px;
+  color: var(--accent);
   text-align: center;
-  margin-top: 1px;
+  margin-top: 4px;
+  min-height: 18px;
 }
 
 /* ── Shutter Display ── */
