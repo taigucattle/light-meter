@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="测光表">
+  <meta name="theme-color" content="#000000">
+  <meta name="description" content="胶片摄影测光表 - Zone System 点测光">
+
+  <!-- iOS home screen icons -->
+  <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png">
+
+  <!-- PWA manifest -->
+  <link rel="manifest" href="./manifest.json">
+
+  <!-- Splash screen -->
+  <link rel="apple-touch-startup-image" media="screen and (device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3)" href="./icons/splash-iphone.png">
+
+  <title>胶片测光表</title>
+  <link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+
+  <!-- ── 取景器区域 ── -->
+  <div id="viewfinder">
+    <video id="camera-preview" playsinline autoplay muted></video>
+    <canvas id="camera-canvas"></canvas>
+
+    <!-- 画幅框线 -->
+    <div id="frame-lines"></div>
+
+    <!-- 测光点标记 -->
+    <div id="metering-points"></div>
+
+    <!-- 斑马纹覆盖层 -->
+    <canvas id="zebra-overlay"></canvas>
+
+    <!-- 取景器顶部信息 -->
+    <div id="viewfinder-info">
+      <span id="vf-format">135</span>
+      <span id="vf-focal">50mm</span>
+    </div>
+
+    <!-- 曝光预览覆盖层 -->
+    <div id="exposure-preview-overlay" class="hidden"></div>
+
+    <!-- 取景器底部提示 -->
+    <div id="viewfinder-hint">点击画面添加测光点</div>
+  </div>
+
+  <!-- ── 控制面板 ── -->
+  <div id="control-panel">
+
+    <!-- 胶片设置行 -->
+    <div id="film-settings">
+      <div class="setting-group">
+        <label>画幅</label>
+        <select id="select-format"></select>
+      </div>
+      <div class="setting-group">
+        <label>焦距</label>
+        <select id="select-focal"></select>
+      </div>
+      <div class="setting-group">
+        <label>胶片</label>
+        <select id="select-film"></select>
+      </div>
+    </div>
+
+    <!-- 曝光设置行 -->
+    <div id="exposure-settings">
+      <div class="setting-group">
+        <label>光圈</label>
+        <select id="select-aperture"></select>
+      </div>
+      <div class="setting-group">
+        <label>ISO</label>
+        <input type="number" id="input-iso" value="400" min="6" max="25600" inputmode="numeric">
+      </div>
+      <div class="setting-group">
+        <label>滤镜</label>
+        <select id="select-filter"></select>
+      </div>
+    </div>
+
+    <!-- ── Zone 尺子 ── -->
+    <div id="zone-scale-container">
+      <div id="zone-scale">
+        <!-- 固定的 Zone 标尺（不移动） -->
+        <div id="zone-labels">
+          <span>0</span><span>I</span><span>II</span><span>III</span><span>IV</span>
+          <span class="zone-v-label">V</span>
+          <span>VI</span><span>VII</span><span>VIII</span><span>IX</span><span>X</span>
+        </div>
+        <!-- 轨道 + 快门标尺（随拖动一起滑动） -->
+        <div id="zone-track">
+          <div id="zone-track-inner">
+            <div id="shutter-tape">
+              <span>--</span><span>--</span><span>--</span><span>--</span><span>--</span>
+              <span>--</span><span>--</span><span>--</span><span>--</span><span>--</span>
+              <span>--</span><span>--</span><span>--</span><span>--</span><span>--</span>
+              <span>--</span><span>--</span><span>--</span><span>--</span><span>--</span>
+              <span>--</span>
+            </div>
+            <div id="zone-markers"></div>
+          </div>
+          <div id="zone-v-line"></div>
+        </div>
+      </div>
+      <div id="zone-info">点击取景画面添加测光点</div>
+    </div>
+
+    <!-- 快门显示 -->
+    <div id="shutter-display">
+      <div id="shutter-label">快门速度</div>
+      <div id="shutter-value">--</div>
+      <div id="shutter-comp">--</div>
+    </div>
+
+    <!-- 底部按钮行 -->
+    <div id="bottom-toolbar">
+      <button id="btn-preview" class="toolbar-btn">
+        <span id="preview-icon">👁</span>
+        <span>预览</span>
+      </button>
+      <button id="btn-zebra" class="toolbar-btn active">
+        <span>🦓</span>
+        <span>斑马纹</span>
+      </button>
+      <button id="btn-clear" class="toolbar-btn">
+        <span>✕</span>
+        <span>清除点</span>
+      </button>
+      <button id="btn-undo" class="toolbar-btn">
+        <span>↩</span>
+        <span>撤销</span>
+      </button>
+      <button id="btn-calibrate" class="toolbar-btn">
+        <span>⚙</span>
+        <span>校准</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- ── 校准弹窗 ── -->
+  <div id="calibration-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3>校准测光表</h3>
+      <p>在晴朗阳光下，将摄像头对准中灰场景（草地、水泥路面），点击校准。</p>
+      <p class="hint">参考：晴天 F16 法则 = EV 15 (ISO 100)</p>
+      <div id="calibration-status"></div>
+      <div class="modal-buttons">
+        <button id="btn-cal-do">立即校准 (EV 15)</button>
+        <button id="btn-cal-manual">手动输入参考 EV</button>
+        <button id="btn-cal-close" class="secondary">关闭</button>
+      </div>
+      <div id="cal-manual-input" class="hidden">
+        <label>参考 EV: <input type="number" id="input-ref-ev" value="15" step="0.1"></label>
+        <button id="btn-cal-manual-do">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 胶片详情弹窗 ── -->
+  <div id="film-detail-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3 id="film-detail-name"></h3>
+      <div id="film-detail-info"></div>
+      <button id="btn-film-detail-close" class="secondary">关闭</button>
+    </div>
+  </div>
+
+  <!-- ── Scripts ── -->
+  <script type="module" src="./js/camera.js"></script>
+  <script type="module" src="./js/lightmeter.js"></script>
+  <script type="module" src="./js/films.js"></script>
+  <script type="module" src="./js/ui.js"></script>
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
