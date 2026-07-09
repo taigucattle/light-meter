@@ -85,22 +85,35 @@ async function startCamera() {
  * User triggers EXIF photo capture from calibration modal.
  */
 async function captureExifParams() {
-  if (!state.track) return;
   const resultEl = document.getElementById('exif-result');
-  if (resultEl) resultEl.textContent = '正在拍摄...';
-  UI.showViewfinderHint('正在拍摄...', 0);
-  const exif = await Camera.captureExifPhoto(state.track);
-  if (exif && exif.exposureTime) {
-    state.cameraExposureTime = exif.exposureTime;
-    state.cameraISO = exif.iso || state.cameraISO;
-    if (exif.fNumber) state.phoneFNumber = exif.fNumber;
-    state.paramMethod = 'EXIF';
-    const msg = `✓ EXIF: 1/${Math.round(1/exif.exposureTime)}s ISO${exif.iso || '?'} f/${exif.fNumber?.toFixed(1) || state.phoneFNumber.toFixed(1)}`;
-    if (resultEl) resultEl.textContent = msg;
-    UI.showViewfinderHint(msg, 5000);
-  } else {
-    if (resultEl) resultEl.textContent = '⚠ EXIF 读取失败，请重试';
-    UI.showViewfinderHint('⚠ EXIF 读取失败', 3000);
+  if (!state.track) {
+    if (resultEl) resultEl.textContent = '⚠ 摄像头未就绪';
+    return;
+  }
+  if (typeof ImageCapture === 'undefined') {
+    if (resultEl) resultEl.textContent = '⚠ 浏览器不支持 ImageCapture';
+    return;
+  }
+  if (resultEl) resultEl.textContent = '📷 正在拍摄...';
+  UI.showViewfinderHint('📷 正在拍摄...', 0);
+  try {
+    const exif = await Camera.captureExifPhoto(state.track);
+    if (exif && exif.exposureTime) {
+      state.cameraExposureTime = exif.exposureTime;
+      state.cameraISO = exif.iso || state.cameraISO;
+      if (exif.fNumber) state.phoneFNumber = exif.fNumber;
+      state.paramMethod = 'EXIF';
+      const msg = `✓ EXIF: 1/${Math.round(1/exif.exposureTime)}s ISO${exif.iso||'?'} f/${(exif.fNumber||state.phoneFNumber).toFixed(1)}`;
+      if (resultEl) resultEl.textContent = msg;
+      UI.showViewfinderHint(msg, 5000);
+    } else {
+      if (resultEl) resultEl.textContent = '⚠ EXIF 未读到曝光数据，请重试';
+      UI.showViewfinderHint('⚠ EXIF 无数据', 3000);
+    }
+  } catch (err) {
+    if (resultEl) resultEl.textContent = '⚠ 错误: ' + err.message;
+    UI.showViewfinderHint('⚠ 拍摄失败: ' + err.message, 4000);
+    console.error('EXIF capture error:', err);
   }
 }
 
