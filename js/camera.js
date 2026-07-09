@@ -6,8 +6,7 @@
 import { readExifFromCamera } from './exif.js';
 
 /**
- * Initialize rear camera. Reads exposure params from
- * JPEG EXIF (100% reliable on iOS) as primary method.
+ * Initialize rear camera (video only, no auto photo capture).
  */
 export async function initCamera(videoElement) {
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -24,30 +23,29 @@ export async function initCamera(videoElement) {
   await videoElement.play();
   const track = stream.getVideoTracks()[0];
 
-  // Primary: read EXIF from a captured photo (100% reliable on iOS)
+  // Try getSettings() first (no extra permission)
   let exposureTime = null, iso = null, method = 'none';
-
-  try {
-    const exif = await readExifFromCamera(track);
-    if (exif && exif.exposureTime) {
-      exposureTime = exif.exposureTime;
-      iso = exif.iso;
-      method = 'EXIF';
-    }
-  } catch (e) { /* EXIF capture failed */ }
-
-  // Fallback: getSettings() polling
-  if (!exposureTime) {
-    for (let i = 0; i < 5 && !exposureTime; i++) {
-      await new Promise(r => setTimeout(r, 300));
-      const s = track.getSettings();
-      exposureTime = s.exposureTime ?? null;
-      iso = s.iso ?? null;
-    }
-    if (exposureTime) method = 'getSettings';
+  for (let i = 0; i < 5 && !exposureTime; i++) {
+    await new Promise(r => setTimeout(r, 300));
+    const s = track.getSettings();
+    exposureTime = s.exposureTime ?? null;
+    iso = s.iso ?? null;
   }
+  if (exposureTime) method = 'getSettings';
 
   return { stream, track, video: videoElement, exposureTime, iso, method };
+}
+
+/**
+ * User-triggered: capture photo + read EXIF.
+ * Returns { exposureTime, iso, fNumber } from EXIF.
+ */
+export async function captureExifPhoto(track) {
+  const exif = await readExifFromCamera(track);
+  if (exif && exif.exposureTime) {
+    return { exposureTime: exif.exposureTime, iso: exif.iso, fNumber: exif.fNumber };
+  }
+  return null;
 }
 
 export function createSamplingCanvas(width = 160, height = 120) {

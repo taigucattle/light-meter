@@ -17,6 +17,7 @@ const state = {
   // Real exposure params (may be null on iOS)
   cameraExposureTime: null,
   cameraISO: null,
+  phoneFNumber: 1.8,
   paramMethod: 'none',
 
   fullFrameAvgY: 0,
@@ -73,11 +74,34 @@ async function startCamera() {
   state.cameraReady = true;
 
   if (cam.exposureTime) {
-    UI.showViewfinderHint(`✓ 曝光参数 (${cam.method}): 1/${Math.round(1/cam.exposureTime)}s ISO${cam.iso}`, 3000);
+    UI.showViewfinderHint(`✓ 曝光参数已读取 · 点击画面测光`, 2500);
   } else {
-    UI.showViewfinderHint('⚠ 无法读取曝光参数 · 需晴天校准 ⚙', 4000);
+    UI.showViewfinderHint('📷 点 ⚙ → 拍照片读取参数', 0);
   }
-  console.log('Camera method:', cam.method, 'ET:', cam.exposureTime, 'ISO:', cam.iso);
+  console.log('Camera ready, method:', cam.method);
+}
+
+/**
+ * User triggers EXIF photo capture from calibration modal.
+ */
+async function captureExifParams() {
+  if (!state.track) return;
+  const resultEl = document.getElementById('exif-result');
+  if (resultEl) resultEl.textContent = '正在拍摄...';
+  UI.showViewfinderHint('正在拍摄...', 0);
+  const exif = await Camera.captureExifPhoto(state.track);
+  if (exif && exif.exposureTime) {
+    state.cameraExposureTime = exif.exposureTime;
+    state.cameraISO = exif.iso || state.cameraISO;
+    if (exif.fNumber) state.phoneFNumber = exif.fNumber;
+    state.paramMethod = 'EXIF';
+    const msg = `✓ EXIF: 1/${Math.round(1/exif.exposureTime)}s ISO${exif.iso || '?'} f/${exif.fNumber?.toFixed(1) || state.phoneFNumber.toFixed(1)}`;
+    if (resultEl) resultEl.textContent = msg;
+    UI.showViewfinderHint(msg, 5000);
+  } else {
+    if (resultEl) resultEl.textContent = '⚠ EXIF 读取失败，请重试';
+    UI.showViewfinderHint('⚠ EXIF 读取失败', 3000);
+  }
 }
 
 // ── Reference shutter ──
@@ -95,12 +119,9 @@ function computeReferenceShutter() {
 }
 
 function paramsBasedShutter() {
-  // Same light-per-unit-area at phone sensor and film:
-  // filmShutter = phoneT * (filmAperture/phoneAperture)² * (phoneISO/filmISO)
-  // phoneAperture defaults to 1.8, adjustable via calibration
-  const phoneF = state.calibrated ? Math.sqrt(state.refLuminance || 3.24) : 1.8;
-  // Actually we calibrated luminance, not aperture. Keep default phoneF for params mode.
-  const ratio = state.aperture / 1.8;
+  // EXIF may have provided phoneFNumber; otherwise default to 1.8
+  const phoneF = state.phoneFNumber || 1.8;
+  const ratio = state.aperture / phoneF;
   let t = state.cameraExposureTime * (ratio * ratio) * ((state.cameraISO || 100) / state.iso);
   return Math.max(1/32000, Math.min(120, t));
 }
@@ -231,6 +252,7 @@ function bindButtonEvents(){
   document.getElementById('btn-calibrate').addEventListener('click',()=>{document.getElementById('calibration-modal').classList.remove('hidden');updateCalibrationUI();});
   document.getElementById('btn-cal-close').addEventListener('click',()=>{document.getElementById('calibration-modal').classList.add('hidden');});
   document.getElementById('btn-cal-do').addEventListener('click',()=>doCalibrate(15));
+  document.getElementById('btn-exif-capture').addEventListener('click',()=>captureExifParams());
   document.getElementById('btn-cal-manual').addEventListener('click',()=>{document.getElementById('cal-manual-input').classList.toggle('hidden');});
   document.getElementById('btn-cal-manual-do').addEventListener('click',()=>{const ev=parseFloat(document.getElementById('input-ref-ev').value);if(!isNaN(ev))doCalibrate(ev);});
 }
