@@ -1,13 +1,12 @@
 import SwiftUI
 import AVFoundation
-import CoreImage
 
 // ============================================
 // 胶片测光表 — iPad Swift Playgrounds
-// 参照 Apple CapturingPhotos 示例的架构
+// 直接读取: exposureDuration / ISO / lensAperture
 // ===========================================
 
-// MARK: - App
+// MARK: - App Entry
 
 @main
 struct LightMeterApp: App {
@@ -19,128 +18,65 @@ struct LightMeterApp: App {
     }
 }
 
-// MARK: - Camera Manager (Apple sample pattern)
+// MARK: - Camera Manager (device-only polling, no session)
 
-final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
+class CameraManager: ObservableObject {
     @Published var exposureSeconds: Double = 1/120
     @Published var iso: Float = 200
     @Published var lensF: Float = 1.8
-    @Published var isRunning = false
+    @Published var isLive = false
     @Published var errorMsg: String?
-    @Published var previewImage: CGImage?
 
-    private let session = AVCaptureSession()
-    private var deviceInput: AVCaptureDeviceInput?
-    private var photoOutput: AVCapturePhotoOutput?
-    private var videoOutput: AVCaptureVideoDataOutput?
-    private let sessionQueue = DispatchQueue(label: "camera.session")
-    private var isConfigured = false
-
-    private var addToPreview: ((CIImage) -> Void)?
-    lazy var previewStream: AsyncStream<CIImage> = {
-        AsyncStream { c in self.addToPreview = { c.yield($0) } }
-    }()
+    private var timer: Timer?
+    private var device: AVCaptureDevice?
 
     func start() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized:
-            configureAndStart()
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        switch status {
+        case .authorized: activate()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { ok in
-                if ok { self.configureAndStart() }
-                else { DispatchQueue.main.async { self.errorMsg = "摄像头权限未授权" } }
+                if ok { DispatchQueue.main.async { self.activate() } }
+                else { DispatchQueue.main.async { self.errorMsg = "摄像头权限被拒" } }
             }
         case .denied, .restricted:
-            errorMsg = "请在 设置→隐私→相机 中允许"
+            errorMsg = "请在 设置→隐私→相机 中允许 Swift Playgrounds"
         @unknown default: break
         }
     }
 
-    private func configureAndStart() {
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
+    private func activate() {
+        guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+                ?? AVCaptureDevice.default(for: .video)
+        else { errorMsg = "未找到摄像头"; return }
+        device = dev
 
-            if self.isConfigured {
-                if !self.session.isRunning { self.session.startRunning() }
-                return
-            }
-
-            self.session.beginConfiguration()
-            self.session.sessionPreset = .photo
-
-            guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-                    ?? AVCaptureDevice.default(for: .video),
-                  let input = try? AVCaptureDeviceInput(device: dev)
-            else {
-                self.session.commitConfiguration()
-                DispatchQueue.main.async { self.errorMsg = "无法访问摄像头" }
-                return
-            }
-
-            try? dev.lockForConfiguration()
+        do {
+            try dev.lockForConfiguration()
             if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
             if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
             dev.unlockForConfiguration()
+        } catch {
+            errorMsg = "摄像头配置失败: \(error.localizedDescription)"
+            return
+        }
 
-            guard self.session.canAddInput(input) else {
-                self.session.commitConfiguration(); return
-            }
-            self.session.addInput(input)
-            self.deviceInput = input
+        isLive = true
+        poll()
 
-            let photoOut = AVCapturePhotoOutput()
-            let videoOut = AVCaptureVideoDataOutput()
-            videoOut.setSampleBufferDelegate(self, queue: DispatchQueue(label: "video.out"))
-
-            guard self.session.canAddOutput(photoOut), self.session.canAddOutput(videoOut) else {
-                self.session.commitConfiguration(); return
-            }
-            self.session.addOutput(photoOut)
-            self.session.addOutput(videoOut)
-            self.photoOutput = photoOut
-            self.videoOutput = videoOut
-
-            if let vc = videoOut.connection(with: .video), vc.isVideoMirroringSupported {
-                vc.isVideoMirrored = false
-            }
-
-            self.session.commitConfiguration()
-            self.isConfigured = true
-            self.session.startRunning()
-
-            DispatchQueue.main.async {
-                self.isRunning = true
-                self.startPolling()
-            }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+            self?.poll()
         }
     }
 
-    private func startPolling() {
-        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self, let dev = self.deviceInput?.device else { return }
-            Task { @MainActor in
-                self.exposureSeconds = dev.exposureDuration.seconds
-                self.iso = dev.iso
-                self.lensF = dev.lensAperture
-            }
-        }
+    private func poll() {
+        guard let dev = device else { return }
+        exposureSeconds = dev.exposureDuration.seconds
+        iso = dev.iso
+        lensF = dev.lensAperture
     }
 
-    func stop() {
-        sessionQueue.async { [weak self] in
-            guard let self, self.session.isRunning else { return }
-            self.session.stopRunning()
-        }
-    }
-}
-
-// MARK: - Video frame delegate
-
-extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
-    func captureOutput(_ out: AVCaptureOutput, didOutput buf: CMSampleBuffer, from conn: AVCaptureConnection) {
-        guard let px = CMSampleBufferGetImageBuffer(buf) else { return }
-        addToPreview?(CIImage(cvPixelBuffer: px))
-    }
+    func stop() { timer?.invalidate() }
 }
 
 // MARK: - Light Meter Engine
@@ -177,7 +113,7 @@ func fmtAperture(_ a: Double) -> String {
     return "f/\(i)"
 }
 
-// MARK: - State
+// MARK: - Meter State
 
 class MeterState: ObservableObject {
     @Published var filmISO = 400
@@ -220,43 +156,52 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            GeometryReader { geo in
-                ZStack {
-                    if let err = cam.errorMsg {
-                        Color.black
-                        VStack(spacing: 12) {
-                            Image(systemName: "camera.fill").font(.largeTitle).foregroundColor(.gray)
-                            Text(err).foregroundColor(.gray).multilineTextAlignment(.center)
-                        }.padding()
-                    } else if cam.isRunning {
-                        CamPreview(stream: cam.previewStream)
-                    } else {
-                        Color.black; ProgressView().tint(.white)
-                    }
-                    Rectangle().strokeBorder(.white.opacity(0.5), lineWidth: 2).padding(30)
-                    ForEach(Array(s.points.enumerated()), id: \.offset) { i, pt in
-                        Circle().strokeBorder(.white, lineWidth: 2)
-                            .background(Circle().fill(.orange.opacity(0.5))).frame(width: 16, height: 16)
-                            .overlay(alignment: .top) {
-                                Text("P\(i+1)").font(.system(size:9)).foregroundColor(.white)
-                                    .padding(.horizontal,3).padding(.vertical,1)
-                                    .background(.black.opacity(0.7)).cornerRadius(4).offset(y: -14)
+            // Top: exposure readout (no camera preview)
+            VStack(spacing: 12) {
+                if let err = cam.errorMsg {
+                    Image(systemName: "camera.fill").font(.system(size: 40)).foregroundColor(.gray)
+                    Text(err).foregroundColor(.gray).multilineTextAlignment(.center).padding()
+                } else if cam.isLive {
+                    VStack(spacing: 4) {
+                        Text("📷 摄像头实时参数").font(.caption).foregroundColor(.gray)
+                        HStack(spacing: 24) {
+                            VStack {
+                                Text("手机快门").font(.caption2).foregroundColor(.gray)
+                                Text("1/\(Int(1/max(0.001, cam.exposureSeconds)))")
+                                    .font(.system(size: 22, weight: .bold, design: .monospaced)).foregroundColor(.orange)
                             }
-                            .position(x: pt.x * geo.size.width, y: pt.y * geo.size.height)
+                            VStack {
+                                Text("手机 ISO").font(.caption2).foregroundColor(.gray)
+                                Text("\(Int(cam.iso))").font(.system(size: 22, weight: .bold, design: .monospaced)).foregroundColor(.green)
+                            }
+                            VStack {
+                                Text("手机光圈").font(.caption2).foregroundColor(.gray)
+                                Text("f/\(String(format: "%.1f", cam.lensF))").font(.system(size: 22, weight: .bold, design: .monospaced)).foregroundColor(.blue)
+                            }
+                        }
                     }
+                    .padding(.vertical, 24)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.black)
+                } else {
+                    ProgressView().tint(.white)
+                    Text("正在激活摄像头...").font(.caption).foregroundColor(.gray)
                 }
-                .onTapGesture { loc in
-                    s.addPoint()
-                }
-                .onAppear { geoW = geo.size.width }
             }
-            .layoutPriority(1)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 32)
+            .background(Color.black)
+
+            if cam.isLive {
+                HStack {
+                    ToolBtn("⊕", "添加测光点") { s.addPoint() }
+                }.padding(.vertical, 6)
+            }
 
             VStack(spacing: 4) {
                 HStack(spacing: 6) {
-                    ParamBadge("光圈", fmtAperture(s.aperture))
-                    ParamBadge("ISO", "\(s.filmISO)")
-                    ParamBadge("📷", "1/\(Int(1/max(0.001,cam.exposureSeconds))) ISO\(Int(cam.iso))")
+                    ParamBadge("胶片光圈", fmtAperture(s.aperture))
+                    ParamBadge("胶片 ISO", "\(s.filmISO)")
                 }
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
@@ -284,7 +229,7 @@ struct ContentView: View {
                     .gesture(DragGesture().onChanged { g in
                         s.shift = s.clampShift(s.shift + g.translation.width * (10 / max(1, geoW)))
                     })
-                    Text(s.points.isEmpty ? "点击取景画面" : "拖动轨道")
+                    Text(s.points.isEmpty ? "点「添加测光点」开始" : "拖动轨道调整 Zone")
                         .font(.system(size:10)).foregroundColor(.orange)
                 }
                 HStack {
@@ -312,29 +257,6 @@ struct ContentView: View {
         .ignoresSafeArea(edges: [.bottom])
         .onAppear { cam.start() }
         .onChange(of: cam.exposureSeconds) { _, _ in s.refresh(cam) }
-    }
-}
-
-// MARK: - Camera Preview (AsyncStream-based)
-
-struct CamPreview: View {
-    let stream: AsyncStream<CIImage>
-    @State private var image: CGImage?
-
-    var body: some View {
-        Group {
-            if let img = image {
-                Image(decorative: img, scale: 1.0).resizable().aspectRatio(contentMode: .fill)
-            } else { Color.black }
-        }
-        .task {
-            for await ci in stream {
-                let ctx = CIContext()
-                if let cg = ctx.createCGImage(ci, from: ci.extent) {
-                    await MainActor.run { image = cg }
-                }
-            }
-        }
     }
 }
 
