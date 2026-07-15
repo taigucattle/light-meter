@@ -21,7 +21,7 @@ struct LightMeterApp: App {
 
 // MARK: - Camera Manager (Apple sample pattern)
 
-final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
+final class CameraManager: NSObject, ObservableObject {
     @Published var exposureSeconds: Double = 1/120
     @Published var iso: Float = 200
     @Published var lensF: Float = 1.8
@@ -42,86 +42,75 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     }()
 
     func start() {
-        Task {
-            let ok = await checkPermission()
-            guard ok else {
-                await MainActor.run { errorMsg = "摄像头权限未授权" }
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configureAndStart()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { ok in
+                if ok { self.configureAndStart() }
+                else { DispatchQueue.main.async { self.errorMsg = "摄像头权限未授权" } }
+            }
+        case .denied, .restricted:
+            errorMsg = "请在 设置→隐私→相机 中允许"
+        @unknown default: break
+        }
+    }
+
+    private func configureAndStart() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+
+            if self.isConfigured {
+                if !self.session.isRunning { self.session.startRunning() }
                 return
             }
-            await configureAndStart()
-        }
-    }
 
-    private func checkPermission() async -> Bool {
-        let status = AVCaptureDevice.authorizationStatus(for: .video)
-        switch status {
-        case .authorized: return true
-        case .notDetermined: return await AVCaptureDevice.requestAccess(for: .video)
-        default: return false
-        }
-    }
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .photo
 
-    private func configureAndStart() async {
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            sessionQueue.async { [weak self] in
-                guard let self else { c.resume(); return }
-
-                if self.isConfigured {
-                    if !self.session.isRunning { self.session.startRunning() }
-                    c.resume(); return
-                }
-
-                self.session.beginConfiguration()
-                self.session.sessionPreset = .photo
-
-                guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-                        ?? AVCaptureDevice.default(for: .video),
-                      let input = try? AVCaptureDeviceInput(device: dev)
-                else {
-                    self.session.commitConfiguration()
-                    Task { @MainActor in self.errorMsg = "无法访问摄像头" }
-                    c.resume(); return
-                }
-
-                try? dev.lockForConfiguration()
-                if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
-                if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
-                dev.unlockForConfiguration()
-
-                guard self.session.canAddInput(input) else {
-                    self.session.commitConfiguration()
-                    c.resume(); return
-                }
-                self.session.addInput(input)
-                self.deviceInput = input
-
-                let photoOut = AVCapturePhotoOutput()
-                let videoOut = AVCaptureVideoDataOutput()
-                videoOut.setSampleBufferDelegate(self, queue: DispatchQueue(label: "video.out"))
-
-                guard self.session.canAddOutput(photoOut), self.session.canAddOutput(videoOut) else {
-                    self.session.commitConfiguration()
-                    c.resume(); return
-                }
-                self.session.addOutput(photoOut)
-                self.session.addOutput(videoOut)
-                self.photoOutput = photoOut
-                self.videoOutput = videoOut
-
-                if let vc = videoOut.connection(with: .video), vc.isVideoMirroringSupported {
-                    vc.isVideoMirrored = false
-                }
-
+            guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+                    ?? AVCaptureDevice.default(for: .video),
+                  let input = try? AVCaptureDeviceInput(device: dev)
+            else {
                 self.session.commitConfiguration()
-                self.isConfigured = true
-                self.session.startRunning()
-
-                Task { @MainActor in self.isRunning = true }
-                c.resume()
+                DispatchQueue.main.async { self.errorMsg = "无法访问摄像头" }
+                return
             }
+
+            try? dev.lockForConfiguration()
+            if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
+            if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
+            dev.unlockForConfiguration()
+
+            guard self.session.canAddInput(input) else {
+                self.session.commitConfiguration(); return
+            }
+            self.session.addInput(input)
+            self.deviceInput = input
+
+            let photoOut = AVCapturePhotoOutput()
+            let videoOut = AVCaptureVideoDataOutput()
+            videoOut.setSampleBufferDelegate(self, queue: DispatchQueue(label: "video.out"))
+
+            guard self.session.canAddOutput(photoOut), self.session.canAddOutput(videoOut) else {
+                self.session.commitConfiguration(); return
+            }
+            self.session.addOutput(photoOut)
+            self.session.addOutput(videoOut)
+            self.photoOutput = photoOut
+            self.videoOutput = videoOut
+
+            if let vc = videoOut.connection(with: .video), vc.isVideoMirroringSupported {
+                vc.isVideoMirrored = false
+            }
+
+            self.session.commitConfiguration()
+            self.isConfigured = true
+            self.session.startRunning()
+
+            DispatchQueue.main.async { self.isRunning = true }
         }
 
-        // Start param polling
         startPolling()
     }
 
