@@ -3,11 +3,11 @@ import AVFoundation
 
 // ============================================
 // 胶片测光表 — iPad Swift Playgrounds
-// 直接读取: exposureDuration / ISO / lensAperture
-// 定时轮询（不用 VideoDataOutput，避免沙盒 XPC 错误）
+// 纯设备参数读取，不用 AVCaptureSession
+// 避免沙盒 XPC 限制
 // ===========================================
 
-// MARK: - App Entry
+// MARK: - App
 
 @main
 struct LightMeterApp: App {
@@ -19,81 +19,69 @@ struct LightMeterApp: App {
     }
 }
 
-// MARK: - Camera Manager (polling, no VideoDataOutput)
+// MARK: - Camera (device-only, no session)
 
-class CameraManager: NSObject, ObservableObject {
-    @Published var exposureSeconds: Double = 1/60
+class CameraManager: ObservableObject {
+    @Published var exposureSeconds: Double = 1/120
     @Published var iso: Float = 200
     @Published var lensF: Float = 1.8
-    @Published var fullFrameY: Float = 0.18
-    @Published var isRunning = false
+    @Published var isLive = false
     @Published var errorMsg: String?
 
-    let session = AVCaptureSession()
     private var timer: Timer?
-    private weak var device: AVCaptureDevice?
+    private var device: AVCaptureDevice?
 
     func start() {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
         switch status {
-        case .authorized: configureAndRun()
+        case .authorized: activate()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { ok in
-                if ok { DispatchQueue.main.async { self.configureAndRun() } }
-                else { DispatchQueue.main.async { self.errorMsg = "摄像头权限被拒绝" } }
+                if ok { DispatchQueue.main.async { self.activate() } }
+                else { DispatchQueue.main.async { self.errorMsg = "权限被拒" } }
             }
         case .denied, .restricted:
-            errorMsg = "请在 设置→隐私→相机 中允许 Swift Playgrounds"
-        @unknown default: errorMsg = "未知权限状态"
+            errorMsg = "设置→隐私→相机 中允许 Swift Playgrounds"
+        @unknown default: errorMsg = "未知权限"
         }
     }
 
-    private func configureAndRun() {
-        session.beginConfiguration()
-        session.sessionPreset = .high
-
+    private func activate() {
         guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
                 ?? AVCaptureDevice.default(for: .video)
-        else { session.commitConfiguration(); errorMsg = "未找到摄像头"; return }
+        else { errorMsg = "未找到摄像头"; return }
 
         device = dev
+
+        // Lock & configure to activate the device
         do {
             try dev.lockForConfiguration()
             if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
             if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
             dev.unlockForConfiguration()
-
-            let input = try AVCaptureDeviceInput(device: dev)
-            guard session.canAddInput(input) else { session.commitConfiguration(); errorMsg = "无法添加输入"; return }
-            session.addInput(input)
-            session.commitConfiguration()
-
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                self?.session.startRunning()
-                DispatchQueue.main.async {
-                    self?.isRunning = true
-                    self?.startPolling()
-                }
-            }
         } catch {
-            session.commitConfiguration()
             errorMsg = "配置失败: \(error.localizedDescription)"
+            return
+        }
+
+        isLive = true
+        poll()
+
+        // Poll every 0.15s — fast enough for real-time feel
+        timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+            self?.poll()
         }
     }
 
-    private func startPolling() {
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self, let dev = self.device else { return }
-            self.exposureSeconds = dev.exposureDuration.seconds
-            self.iso = dev.iso
-            self.lensF = dev.lensAperture
-        }
+    private func poll() {
+        guard let dev = device else { return }
+        // These properties are live even without a running AVCaptureSession
+        exposureSeconds = dev.exposureDuration.seconds
+        iso = dev.iso
+        lensF = dev.lensAperture
     }
 
-    func stop() {
-        timer?.invalidate()
-        session.stopRunning()
-    }
+    func stop() { timer?.invalidate() }
 }
 
 // MARK: - Light Meter Engine
@@ -142,9 +130,6 @@ class MeterState: ObservableObject {
     @Published var comp = ""
 
     func refresh(_ cam: CameraManager) {
-        // Without pixel sampling, use equal-luminance assumption
-        // Each point has same luminance until we sample region
-        if !points.isEmpty { }  // offsets stay from manual analysis
         let t = refShutter(phoneT: cam.exposureSeconds, phoneISO: cam.iso,
                            phoneF: cam.lensF, filmA: aperture, filmISO: filmISO) * pow(2, shift)
         let r = rndNearest(t, SHUTTERS)
@@ -155,16 +140,15 @@ class MeterState: ObservableObject {
         comp = c.joined(separator: " · ")
     }
 
-    func add(_ x: CGFloat, _ y: CGFloat) {
-        points.append((x, y))
-        // Assume equal brightness for now; pixel sampling to be added
-        if !offsets.isEmpty || points.count == 1 { offsets = [0] }
+    func addDummy() {
+        points.append((0.5, 0.5))
+        if points.count == 1 { offsets = [0]; shift = 0 }
     }
 
     func removeLast() { if !points.isEmpty { points.removeLast(); if points.isEmpty { offsets.removeAll() } } }
     func clear() { points.removeAll(); offsets.removeAll(); shift = 0 }
 
-    func clamp(_ v: Double) -> Double {
+    func clampShift(_ v: Double) -> Double {
         guard !offsets.isEmpty else { return max(-5, min(5, v)) }
         var lo = -Double.infinity, hi = Double.infinity
         for o in offsets { lo = max(lo, -5-o); hi = min(hi, 5-o) }
@@ -181,49 +165,57 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            GeometryReader { geo in
-                ZStack {
-                    if let err = cam.errorMsg {
-                        Color.black
-                        VStack(spacing: 12) {
-                            Image(systemName: "camera.fill").font(.largeTitle).foregroundColor(.gray)
-                            Text(err).foregroundColor(.gray).multilineTextAlignment(.center)
-                        }.padding()
-                    } else if cam.isRunning {
-                        CamPreview(session: cam.session)
-                    } else {
-                        Color.black; ProgressView().tint(.white)
-                    }
-                    Rectangle().strokeBorder(.white.opacity(0.5), lineWidth: 2).padding(30)
-                    ForEach(Array(s.points.enumerated()), id: \.offset) { i, pt in
-                        Circle().strokeBorder(.white, lineWidth: 2)
-                            .background(Circle().fill(.orange.opacity(0.5)))
-                            .frame(width: 16, height: 16)
-                            .overlay(alignment: .top) {
-                                Text("P\(i+1)").font(.system(size:9)).foregroundColor(.white)
-                                    .padding(.horizontal,3).padding(.vertical,1)
-                                    .background(.black.opacity(0.7)).cornerRadius(4).offset(y: -14)
+            // Status bar — no camera preview, just exposure readout
+            VStack(spacing: 12) {
+                if let err = cam.errorMsg {
+                    Image(systemName: "camera.fill").font(.system(size: 40)).foregroundColor(.gray)
+                    Text(err).foregroundColor(.gray).multilineTextAlignment(.center)
+                } else if cam.isLive {
+                    // Large exposure parameter display
+                    VStack(spacing: 4) {
+                        Text("📷 实时参数").font(.caption).foregroundColor(.gray)
+                        HStack(spacing: 24) {
+                            VStack {
+                                Text("快门").font(.caption2).foregroundColor(.gray)
+                                Text("1/\(Int(1/max(0.001, cam.exposureSeconds)))")
+                                    .font(.system(size: 22, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.orange)
                             }
-                            .position(x: pt.x * geo.size.width, y: pt.y * geo.size.height)
+                            VStack {
+                                Text("ISO").font(.caption2).foregroundColor(.gray)
+                                Text("\(Int(cam.iso))")
+                                    .font(.system(size: 22, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.green)
+                            }
+                            VStack {
+                                Text("光圈").font(.caption2).foregroundColor(.gray)
+                                Text("f/\(String(format: "%.1f", cam.lensF))")
+                                    .font(.system(size: 22, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.blue)
+                            }
+                        }
                     }
-                    if s.points.isEmpty {
-                        Text("点击画面添加测光点").font(.caption)
-                            .padding(.horizontal,12).padding(.vertical,6)
-                            .background(.ultraThinMaterial).cornerRadius(12)
-                    }
+                } else {
+                    ProgressView().tint(.white)
+                    Text("正在激活摄像头...").font(.caption).foregroundColor(.gray)
                 }
-                .onTapGesture { loc in
-                    s.add(loc.x / geo.size.width, loc.y / geo.size.height)
-                }
-                .onAppear { geoW = geo.size.width }
             }
-            .layoutPriority(1)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 32)
+            .background(Color.black)
 
+            // Tap area for metering points
+            if cam.isLive {
+                HStack {
+                    ToolBtn("⊕", "加测光点") { s.addDummy() }
+                }.padding(.vertical, 8)
+            }
+
+            // Controls
             VStack(spacing: 4) {
                 HStack(spacing: 6) {
                     ParamBadge("光圈", fmtAperture(s.aperture))
-                    ParamBadge("ISO", "\(s.filmISO)")
-                    ParamBadge("📷", "1/\(Int(1/max(0.001,cam.exposureSeconds))) ISO\(Int(cam.iso))")
+                    ParamBadge("胶片 ISO", "\(s.filmISO)")
                 }
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
@@ -249,9 +241,9 @@ struct ContentView: View {
                         }
                     }.frame(height:34).cornerRadius(6)
                     .gesture(DragGesture().onChanged { g in
-                        s.shift = s.clamp(s.shift + g.translation.width * (10 / max(1, geoW)))
+                        s.shift = s.clampShift(s.shift + g.translation.width * (10 / max(1, geoW)))
                     })
-                    Text(s.points.isEmpty ? "点击画面测光" : "拖动轨道")
+                    Text(s.points.isEmpty ? "点「加测光点」开始" : "拖动轨道 · 当前 Zone V")
                         .font(.system(size:10)).foregroundColor(.orange)
                 }
                 HStack {
@@ -297,15 +289,5 @@ struct ToolBtn: View {
     var body: some View {
         Button(action: action) { VStack(spacing:0) { Text(icon).font(.system(size:16)); Text(label).font(.system(size:8)) } }
             .padding(.horizontal,8).padding(.vertical,2).background(Color.gray.opacity(0.2)).cornerRadius(6)
-    }
-}
-
-struct CamPreview: UIViewRepresentable {
-    let session: AVCaptureSession
-    func makeUIView(context: Context) -> PrevView { let v = PrevView(); v.pl.session = session; v.pl.videoGravity = .resizeAspectFill; return v }
-    func updateUIView(_: PrevView, context: Context) {}
-    class PrevView: UIView {
-        override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-        var pl: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
     }
 }
