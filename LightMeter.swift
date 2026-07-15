@@ -21,7 +21,7 @@ struct LightMeterApp: App {
 
 // MARK: - Camera Manager (Apple sample pattern)
 
-final class CameraManager: NSObject, ObservableObject {
+final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     @Published var exposureSeconds: Double = 1/120
     @Published var iso: Float = 200
     @Published var lensF: Float = 1.8
@@ -108,10 +108,11 @@ final class CameraManager: NSObject, ObservableObject {
             self.isConfigured = true
             self.session.startRunning()
 
-            DispatchQueue.main.async { self.isRunning = true }
+            DispatchQueue.main.async {
+                self.isRunning = true
+                self.startPolling()
+            }
         }
-
-        startPolling()
     }
 
     private func startPolling() {
