@@ -27,6 +27,7 @@ class CameraManager: NSObject, ObservableObject {
     @Published var lensF: Float = 1.8
     @Published var fullFrameY: Float = 0.18
     @Published var isRunning = false
+    @Published var errorMsg: String?
 
     let session = AVCaptureSession()
     private let output = AVCaptureVideoDataOutput()
@@ -41,29 +42,70 @@ class CameraManager: NSObject, ObservableObject {
 
     func start() {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
-        if status == .authorized { configureAndRun() }
-        else if status == .notDetermined {
-            AVCaptureDevice.requestAccess(for: .video) { ok in if ok { self.configureAndRun() } }
+        switch status {
+        case .authorized:
+            configureAndRun()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { ok in
+                if ok {
+                    DispatchQueue.main.async { self.configureAndRun() }
+                } else {
+                    DispatchQueue.main.async { self.errorMsg = "摄像头权限被拒绝" }
+                }
+            }
+        case .denied, .restricted:
+            errorMsg = "请在 设置→隐私→相机 中允许 Swift Playgrounds 访问摄像头"
+        @unknown default:
+            errorMsg = "未知权限状态"
         }
     }
 
     private func configureAndRun() {
+        // Must be on main thread for UI updates
         session.beginConfiguration()
         session.sessionPreset = .hd1280x720
+
         guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-                ?? AVCaptureDevice.default(for: .video),
-              let input = try? AVCaptureDeviceInput(device: dev),
-              session.canAddInput(input)
-        else { session.commitConfiguration(); return }
-        try? dev.lockForConfiguration()
-        dev.focusMode = .continuousAutoFocus
-        dev.exposureMode = .continuousAutoExposure
-        dev.unlockForConfiguration()
-        session.addInput(input)
-        session.commitConfiguration()
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.session.startRunning()
-            DispatchQueue.main.async { self.isRunning = true }
+                ?? AVCaptureDevice.default(for: .video)
+        else {
+            session.commitConfiguration()
+            errorMsg = "未找到后置摄像头"
+            return
+        }
+
+        do {
+            try dev.lockForConfiguration()
+            if dev.isFocusModeSupported(.continuousAutoFocus) {
+                dev.focusMode = .continuousAutoFocus
+            }
+            if dev.isExposureModeSupported(.continuousAutoExposure) {
+                dev.exposureMode = .continuousAutoExposure
+            }
+            dev.unlockForConfiguration()
+
+            let input = try AVCaptureDeviceInput(device: dev)
+            guard session.canAddInput(input) else {
+                session.commitConfiguration()
+                errorMsg = "无法添加摄像头输入"
+                return
+            }
+            session.addInput(input)
+
+            guard session.canAddOutput(output) else {
+                session.commitConfiguration()
+                errorMsg = "无法添加视频输出"
+                return
+            }
+            session.addOutput(output)
+
+            session.commitConfiguration()
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.session.startRunning()
+                DispatchQueue.main.async { self?.isRunning = true }
+            }
+        } catch {
+            session.commitConfiguration()
+            errorMsg = "摄像头配置失败: \(error.localizedDescription)"
         }
     }
 
@@ -198,7 +240,13 @@ struct ContentView: View {
         VStack(spacing: 0) {
             GeometryReader { geo in
                 ZStack {
-                    if cam.isRunning {
+                    if let err = cam.errorMsg {
+                        Color.black
+                        VStack(spacing: 12) {
+                            Image(systemName: "camera.fill").font(.largeTitle).foregroundColor(.gray)
+                            Text(err).font(.body).foregroundColor(.gray).multilineTextAlignment(.center)
+                        }.padding()
+                    } else if cam.isRunning {
                         CamPreview(session: cam.session)
                     } else { Color.black; ProgressView().tint(.white) }
                     Rectangle().strokeBorder(.white.opacity(0.5), lineWidth: 2).padding(30)
