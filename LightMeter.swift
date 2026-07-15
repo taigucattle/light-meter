@@ -21,7 +21,7 @@ struct LightMeterApp: App {
 
 // MARK: - Camera Manager (Apple sample pattern)
 
-class CameraManager: NSObject, ObservableObject {
+final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     @Published var exposureSeconds: Double = 1/120
     @Published var iso: Float = 200
     @Published var lensF: Float = 1.8
