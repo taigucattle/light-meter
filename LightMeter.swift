@@ -1,12 +1,23 @@
 import SwiftUI
 import AVFoundation
-import PlaygroundSupport
 
 // ============================================
 // 胶片测光表 — iPad Swift Playgrounds
+// 新建 App → 全选替换 → ▶ 运行
 // 直接读取: exposureDuration / ISO / lensAperture
-// 全选粘贴到 Swift Playgrounds 点 ▶ 即可
-// ============================================
+// ===========================================
+
+// MARK: - App Entry
+
+@main
+struct LightMeterApp: App {
+    @StateObject private var cam = CameraManager()
+    var body: some Scene {
+        WindowGroup {
+            ContentView().environmentObject(cam).preferredColorScheme(.dark)
+        }
+    }
+}
 
 // MARK: - Camera Manager
 
@@ -214,7 +225,7 @@ struct ContentView: View {
                 }
                 .onAppear { geoW = geo.size.width }
             }
-            .frame(maxHeight: UIScreen.main.bounds.height * 0.52)
+            .layoutPriority(1)
 
             VStack(spacing: 4) {
                 HStack(spacing: 6) {
@@ -311,8 +322,3 @@ struct CamPreview: UIViewRepresentable {
     }
 }
 
-// MARK: - Playground Entry
-
-let cam = CameraManager()
-let contentView = ContentView().environmentObject(cam).preferredColorScheme(.dark)
-PlaygroundPage.current.setLiveView(contentView)
