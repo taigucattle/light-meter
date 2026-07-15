@@ -1,10 +1,10 @@
 import SwiftUI
 import AVFoundation
+import CoreImage
 
 // ============================================
 // 胶片测光表 — iPad Swift Playgrounds
-// 纯设备参数读取，不用 AVCaptureSession
-// 避免沙盒 XPC 限制
+// 参照 Apple CapturingPhotos 示例的架构
 // ===========================================
 
 // MARK: - App
@@ -19,69 +19,138 @@ struct LightMeterApp: App {
     }
 }
 
-// MARK: - Camera (device-only, no session)
+// MARK: - Camera Manager (Apple sample pattern)
 
-class CameraManager: ObservableObject {
+class CameraManager: NSObject, ObservableObject {
     @Published var exposureSeconds: Double = 1/120
     @Published var iso: Float = 200
     @Published var lensF: Float = 1.8
-    @Published var isLive = false
+    @Published var isRunning = false
     @Published var errorMsg: String?
+    @Published var previewImage: CGImage?
 
-    private var timer: Timer?
-    private var device: AVCaptureDevice?
+    private let session = AVCaptureSession()
+    private var deviceInput: AVCaptureDeviceInput?
+    private var photoOutput: AVCapturePhotoOutput?
+    private var videoOutput: AVCaptureVideoDataOutput?
+    private let sessionQueue = DispatchQueue(label: "camera.session")
+    private var isConfigured = false
+
+    private var addToPreview: ((CIImage) -> Void)?
+    lazy var previewStream: AsyncStream<CIImage> = {
+        AsyncStream { c in self.addToPreview = { c.yield($0) } }
+    }()
 
     func start() {
+        Task {
+            let ok = await checkPermission()
+            guard ok else {
+                await MainActor.run { errorMsg = "摄像头权限未授权" }
+                return
+            }
+            await configureAndStart()
+        }
+    }
+
+    private func checkPermission() async -> Bool {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
         switch status {
-        case .authorized: activate()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { ok in
-                if ok { DispatchQueue.main.async { self.activate() } }
-                else { DispatchQueue.main.async { self.errorMsg = "权限被拒" } }
+        case .authorized: return true
+        case .notDetermined: return await AVCaptureDevice.requestAccess(for: .video)
+        default: return false
+        }
+    }
+
+    private func configureAndStart() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            sessionQueue.async { [weak self] in
+                guard let self else { c.resume(); return }
+
+                if self.isConfigured {
+                    if !self.session.isRunning { self.session.startRunning() }
+                    c.resume(); return
+                }
+
+                self.session.beginConfiguration()
+                self.session.sessionPreset = .photo
+
+                guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+                        ?? AVCaptureDevice.default(for: .video),
+                      let input = try? AVCaptureDeviceInput(device: dev)
+                else {
+                    self.session.commitConfiguration()
+                    Task { @MainActor in self.errorMsg = "无法访问摄像头" }
+                    c.resume(); return
+                }
+
+                try? dev.lockForConfiguration()
+                if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
+                if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
+                dev.unlockForConfiguration()
+
+                guard self.session.canAddInput(input) else {
+                    self.session.commitConfiguration()
+                    c.resume(); return
+                }
+                self.session.addInput(input)
+                self.deviceInput = input
+
+                let photoOut = AVCapturePhotoOutput()
+                let videoOut = AVCaptureVideoDataOutput()
+                videoOut.setSampleBufferDelegate(self, queue: DispatchQueue(label: "video.out"))
+
+                guard self.session.canAddOutput(photoOut), self.session.canAddOutput(videoOut) else {
+                    self.session.commitConfiguration()
+                    c.resume(); return
+                }
+                self.session.addOutput(photoOut)
+                self.session.addOutput(videoOut)
+                self.photoOutput = photoOut
+                self.videoOutput = videoOut
+
+                if let vc = videoOut.connection(with: .video), vc.isVideoMirroringSupported {
+                    vc.isVideoMirrored = false
+                }
+
+                self.session.commitConfiguration()
+                self.isConfigured = true
+                self.session.startRunning()
+
+                Task { @MainActor in self.isRunning = true }
+                c.resume()
             }
-        case .denied, .restricted:
-            errorMsg = "设置→隐私→相机 中允许 Swift Playgrounds"
-        @unknown default: errorMsg = "未知权限"
+        }
+
+        // Start param polling
+        startPolling()
+    }
+
+    private func startPolling() {
+        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self, let dev = self.deviceInput?.device else { return }
+            Task { @MainActor in
+                self.exposureSeconds = dev.exposureDuration.seconds
+                self.iso = dev.iso
+                self.lensF = dev.lensAperture
+            }
         }
     }
 
-    private func activate() {
-        guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-                ?? AVCaptureDevice.default(for: .video)
-        else { errorMsg = "未找到摄像头"; return }
-
-        device = dev
-
-        // Lock & configure to activate the device
-        do {
-            try dev.lockForConfiguration()
-            if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
-            if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
-            dev.unlockForConfiguration()
-        } catch {
-            errorMsg = "配置失败: \(error.localizedDescription)"
-            return
-        }
-
-        isLive = true
-        poll()
-
-        // Poll every 0.15s — fast enough for real-time feel
-        timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
-            self?.poll()
+    func stop() {
+        sessionQueue.async { [weak self] in
+            guard let self, self.session.isRunning else { return }
+            self.session.stopRunning()
         }
     }
+}
 
-    private func poll() {
-        guard let dev = device else { return }
-        // These properties are live even without a running AVCaptureSession
-        exposureSeconds = dev.exposureDuration.seconds
-        iso = dev.iso
-        lensF = dev.lensAperture
+// MARK: - Video frame delegate
+
+extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
+    func captureOutput(_ out: AVCaptureOutput, didOutput buf: CMSampleBuffer, from conn: AVCaptureConnection) {
+        guard let px = CMSampleBufferGetImageBuffer(buf) else { return }
+        addToPreview?(CIImage(cvPixelBuffer: px))
     }
-
-    func stop() { timer?.invalidate() }
 }
 
 // MARK: - Light Meter Engine
@@ -140,11 +209,7 @@ class MeterState: ObservableObject {
         comp = c.joined(separator: " · ")
     }
 
-    func addDummy() {
-        points.append((0.5, 0.5))
-        if points.count == 1 { offsets = [0]; shift = 0 }
-    }
-
+    func addPoint() { points.append((0.5, 0.5)); if points.count == 1 { offsets = [0]; shift = 0 } }
     func removeLast() { if !points.isEmpty { points.removeLast(); if points.isEmpty { offsets.removeAll() } } }
     func clear() { points.removeAll(); offsets.removeAll(); shift = 0 }
 
@@ -165,57 +230,43 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Status bar — no camera preview, just exposure readout
-            VStack(spacing: 12) {
-                if let err = cam.errorMsg {
-                    Image(systemName: "camera.fill").font(.system(size: 40)).foregroundColor(.gray)
-                    Text(err).foregroundColor(.gray).multilineTextAlignment(.center)
-                } else if cam.isLive {
-                    // Large exposure parameter display
-                    VStack(spacing: 4) {
-                        Text("📷 实时参数").font(.caption).foregroundColor(.gray)
-                        HStack(spacing: 24) {
-                            VStack {
-                                Text("快门").font(.caption2).foregroundColor(.gray)
-                                Text("1/\(Int(1/max(0.001, cam.exposureSeconds)))")
-                                    .font(.system(size: 22, weight: .bold, design: .monospaced))
-                                    .foregroundColor(.orange)
-                            }
-                            VStack {
-                                Text("ISO").font(.caption2).foregroundColor(.gray)
-                                Text("\(Int(cam.iso))")
-                                    .font(.system(size: 22, weight: .bold, design: .monospaced))
-                                    .foregroundColor(.green)
-                            }
-                            VStack {
-                                Text("光圈").font(.caption2).foregroundColor(.gray)
-                                Text("f/\(String(format: "%.1f", cam.lensF))")
-                                    .font(.system(size: 22, weight: .bold, design: .monospaced))
-                                    .foregroundColor(.blue)
-                            }
-                        }
+            GeometryReader { geo in
+                ZStack {
+                    if let err = cam.errorMsg {
+                        Color.black
+                        VStack(spacing: 12) {
+                            Image(systemName: "camera.fill").font(.largeTitle).foregroundColor(.gray)
+                            Text(err).foregroundColor(.gray).multilineTextAlignment(.center)
+                        }.padding()
+                    } else if cam.isRunning {
+                        CamPreview(stream: cam.previewStream)
+                    } else {
+                        Color.black; ProgressView().tint(.white)
                     }
-                } else {
-                    ProgressView().tint(.white)
-                    Text("正在激活摄像头...").font(.caption).foregroundColor(.gray)
+                    Rectangle().strokeBorder(.white.opacity(0.5), lineWidth: 2).padding(30)
+                    ForEach(Array(s.points.enumerated()), id: \.offset) { i, pt in
+                        Circle().strokeBorder(.white, lineWidth: 2)
+                            .background(Circle().fill(.orange.opacity(0.5))).frame(width: 16, height: 16)
+                            .overlay(alignment: .top) {
+                                Text("P\(i+1)").font(.system(size:9)).foregroundColor(.white)
+                                    .padding(.horizontal,3).padding(.vertical,1)
+                                    .background(.black.opacity(0.7)).cornerRadius(4).offset(y: -14)
+                            }
+                            .position(x: pt.x * geo.size.width, y: pt.y * geo.size.height)
+                    }
                 }
+                .onTapGesture { loc in
+                    s.addPoint()
+                }
+                .onAppear { geoW = geo.size.width }
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 32)
-            .background(Color.black)
+            .layoutPriority(1)
 
-            // Tap area for metering points
-            if cam.isLive {
-                HStack {
-                    ToolBtn("⊕", "加测光点") { s.addDummy() }
-                }.padding(.vertical, 8)
-            }
-
-            // Controls
             VStack(spacing: 4) {
                 HStack(spacing: 6) {
                     ParamBadge("光圈", fmtAperture(s.aperture))
-                    ParamBadge("胶片 ISO", "\(s.filmISO)")
+                    ParamBadge("ISO", "\(s.filmISO)")
+                    ParamBadge("📷", "1/\(Int(1/max(0.001,cam.exposureSeconds))) ISO\(Int(cam.iso))")
                 }
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
@@ -243,7 +294,7 @@ struct ContentView: View {
                     .gesture(DragGesture().onChanged { g in
                         s.shift = s.clampShift(s.shift + g.translation.width * (10 / max(1, geoW)))
                     })
-                    Text(s.points.isEmpty ? "点「加测光点」开始" : "拖动轨道 · 当前 Zone V")
+                    Text(s.points.isEmpty ? "点击取景画面" : "拖动轨道")
                         .font(.system(size:10)).foregroundColor(.orange)
                 }
                 HStack {
@@ -271,6 +322,29 @@ struct ContentView: View {
         .ignoresSafeArea(edges: [.bottom])
         .onAppear { cam.start() }
         .onChange(of: cam.exposureSeconds) { _, _ in s.refresh(cam) }
+    }
+}
+
+// MARK: - Camera Preview (AsyncStream-based)
+
+struct CamPreview: View {
+    let stream: AsyncStream<CIImage>
+    @State private var image: CGImage?
+
+    var body: some View {
+        Group {
+            if let img = image {
+                Image(decorative: img, scale: 1.0).resizable().aspectRatio(contentMode: .fill)
+            } else { Color.black }
+        }
+        .task {
+            for await ci in stream {
+                let ctx = CIContext()
+                if let cg = ctx.createCGImage(ci, from: ci.extent) {
+                    await MainActor.run { image = cg }
+                }
+            }
+        }
     }
 }
 
