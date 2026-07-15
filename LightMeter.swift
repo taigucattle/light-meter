@@ -3,8 +3,8 @@ import AVFoundation
 
 // ============================================
 // 胶片测光表 — iPad Swift Playgrounds
-// 新建 App → 全选替换 → ▶ 运行
 // 直接读取: exposureDuration / ISO / lensAperture
+// 定时轮询（不用 VideoDataOutput，避免沙盒 XPC 错误）
 // ===========================================
 
 // MARK: - App Entry
@@ -19,7 +19,7 @@ struct LightMeterApp: App {
     }
 }
 
-// MARK: - Camera Manager
+// MARK: - Camera Manager (polling, no VideoDataOutput)
 
 class CameraManager: NSObject, ObservableObject {
     @Published var exposureSeconds: Double = 1/60
@@ -30,122 +30,69 @@ class CameraManager: NSObject, ObservableObject {
     @Published var errorMsg: String?
 
     let session = AVCaptureSession()
-    private let output = AVCaptureVideoDataOutput()
-    private let queue = DispatchQueue(label: "cam", qos: .userInteractive)
-    private var lastT: TimeInterval = 0
-
-    override init() {
-        super.init()
-        output.setSampleBufferDelegate(self, queue: queue)
-        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-    }
+    private var timer: Timer?
+    private weak var device: AVCaptureDevice?
 
     func start() {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
         switch status {
-        case .authorized:
-            configureAndRun()
+        case .authorized: configureAndRun()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { ok in
-                if ok {
-                    DispatchQueue.main.async { self.configureAndRun() }
-                } else {
-                    DispatchQueue.main.async { self.errorMsg = "摄像头权限被拒绝" }
-                }
+                if ok { DispatchQueue.main.async { self.configureAndRun() } }
+                else { DispatchQueue.main.async { self.errorMsg = "摄像头权限被拒绝" } }
             }
         case .denied, .restricted:
-            errorMsg = "请在 设置→隐私→相机 中允许 Swift Playgrounds 访问摄像头"
-        @unknown default:
-            errorMsg = "未知权限状态"
+            errorMsg = "请在 设置→隐私→相机 中允许 Swift Playgrounds"
+        @unknown default: errorMsg = "未知权限状态"
         }
     }
 
     private func configureAndRun() {
-        // Must be on main thread for UI updates
         session.beginConfiguration()
-        session.sessionPreset = .hd1280x720
+        session.sessionPreset = .high
 
         guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
                 ?? AVCaptureDevice.default(for: .video)
-        else {
-            session.commitConfiguration()
-            errorMsg = "未找到后置摄像头"
-            return
-        }
+        else { session.commitConfiguration(); errorMsg = "未找到摄像头"; return }
 
+        device = dev
         do {
             try dev.lockForConfiguration()
-            if dev.isFocusModeSupported(.continuousAutoFocus) {
-                dev.focusMode = .continuousAutoFocus
-            }
-            if dev.isExposureModeSupported(.continuousAutoExposure) {
-                dev.exposureMode = .continuousAutoExposure
-            }
+            if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
+            if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
             dev.unlockForConfiguration()
 
             let input = try AVCaptureDeviceInput(device: dev)
-            guard session.canAddInput(input) else {
-                session.commitConfiguration()
-                errorMsg = "无法添加摄像头输入"
-                return
-            }
+            guard session.canAddInput(input) else { session.commitConfiguration(); errorMsg = "无法添加输入"; return }
             session.addInput(input)
-
-            guard session.canAddOutput(output) else {
-                session.commitConfiguration()
-                errorMsg = "无法添加视频输出"
-                return
-            }
-            session.addOutput(output)
-
             session.commitConfiguration()
+
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 self?.session.startRunning()
-                DispatchQueue.main.async { self?.isRunning = true }
+                DispatchQueue.main.async {
+                    self?.isRunning = true
+                    self?.startPolling()
+                }
             }
         } catch {
             session.commitConfiguration()
-            errorMsg = "摄像头配置失败: \(error.localizedDescription)"
+            errorMsg = "配置失败: \(error.localizedDescription)"
         }
     }
 
-    private func refreshParams() {
-        guard let dev = (session.inputs.first as? AVCaptureDeviceInput)?.device else { return }
-        DispatchQueue.main.async {
+    private func startPolling() {
+        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self, let dev = self.device else { return }
             self.exposureSeconds = dev.exposureDuration.seconds
             self.iso = dev.iso
             self.lensF = dev.lensAperture
         }
     }
 
-    private func avgLuminance(_ buf: CVPixelBuffer) -> Float {
-        CVPixelBufferLockBaseAddress(buf, .readOnly); defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
-        let w = CVPixelBufferGetWidth(buf), h = CVPixelBufferGetHeight(buf)
-        let row = CVPixelBufferGetBytesPerRow(buf)
-        guard let base = CVPixelBufferGetBaseAddress(buf)?.assumingMemoryBound(to: UInt8.self) else { return 0.18 }
-        var total: Float = 0; var n = 0; let step = 4
-        for y in stride(from: 0, to: h, by: step) {
-            for x in stride(from: 0, to: w, by: step) {
-                let o = y * row + x * 4
-                let r = s2l(Float(base[o+2])/255), g = s2l(Float(base[o+1])/255), b = s2l(Float(base[o])/255)
-                total += 0.2126*r + 0.7152*g + 0.0722*b; n += 1
-            }
-        }
-        return n > 0 ? total / Float(n) : 0.18
-    }
-    private func s2l(_ c: Float) -> Float { c <= 0.04045 ? c/12.92 : pow((c+0.055)/1.055, 2.4) }
-}
-
-extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
-    func captureOutput(_ out: AVCaptureOutput, didOutput buf: CMSampleBuffer, from conn: AVCaptureConnection) {
-        let t = CACurrentMediaTime()
-        guard t - lastT >= 0.1 else { return }
-        lastT = t
-        refreshParams()
-        if let px = CMSampleBufferGetImageBuffer(buf) {
-            let y = avgLuminance(px)
-            DispatchQueue.main.async { self.fullFrameY = y }
-        }
+    func stop() {
+        timer?.invalidate()
+        session.stopRunning()
     }
 }
 
@@ -188,20 +135,16 @@ func fmtAperture(_ a: Double) -> String {
 class MeterState: ObservableObject {
     @Published var filmISO = 400
     @Published var aperture: Double = 8
-    @Published var points: [(x: CGFloat, y: CGFloat, yLin: Float)] = []
+    @Published var points: [(x: CGFloat, y: CGFloat)] = []
     @Published var offsets: [Double] = []
     @Published var shift: Double = 0
     @Published var shutter = "--"
     @Published var comp = ""
 
     func refresh(_ cam: CameraManager) {
-        if !points.isEmpty {
-            let lums = points.map(\.yLin)
-            offsets = lums.map { p in
-                let r = Double(p)/Double(cam.fullFrameY > 0 ? cam.fullFrameY : 0.18)
-                return log2(max(1/1024, min(1024, r)))
-            }
-        } else { offsets = [] }
+        // Without pixel sampling, use equal-luminance assumption
+        // Each point has same luminance until we sample region
+        if !points.isEmpty { }  // offsets stay from manual analysis
         let t = refShutter(phoneT: cam.exposureSeconds, phoneISO: cam.iso,
                            phoneF: cam.lensF, filmA: aperture, filmISO: filmISO) * pow(2, shift)
         let r = rndNearest(t, SHUTTERS)
@@ -212,16 +155,16 @@ class MeterState: ObservableObject {
         comp = c.joined(separator: " · ")
     }
 
-    func add(_ x: CGFloat, _ y: CGFloat, _ cam: CameraManager) {
-        points.append((x, y, cam.fullFrameY))
-        refresh(cam)
-        if points.count == 1 && !offsets.isEmpty { shift = clamp(-offsets[0]) }
+    func add(_ x: CGFloat, _ y: CGFloat) {
+        points.append((x, y))
+        // Assume equal brightness for now; pixel sampling to be added
+        if !offsets.isEmpty || points.count == 1 { offsets = [0] }
     }
 
-    func removeLast() { if !points.isEmpty { points.removeLast(); offsets.removeAll() } }
+    func removeLast() { if !points.isEmpty { points.removeLast(); if points.isEmpty { offsets.removeAll() } } }
     func clear() { points.removeAll(); offsets.removeAll(); shift = 0 }
 
-    private func clamp(_ v: Double) -> Double {
+    func clamp(_ v: Double) -> Double {
         guard !offsets.isEmpty else { return max(-5, min(5, v)) }
         var lo = -Double.infinity, hi = Double.infinity
         for o in offsets { lo = max(lo, -5-o); hi = min(hi, 5-o) }
@@ -244,11 +187,13 @@ struct ContentView: View {
                         Color.black
                         VStack(spacing: 12) {
                             Image(systemName: "camera.fill").font(.largeTitle).foregroundColor(.gray)
-                            Text(err).font(.body).foregroundColor(.gray).multilineTextAlignment(.center)
+                            Text(err).foregroundColor(.gray).multilineTextAlignment(.center)
                         }.padding()
                     } else if cam.isRunning {
                         CamPreview(session: cam.session)
-                    } else { Color.black; ProgressView().tint(.white) }
+                    } else {
+                        Color.black; ProgressView().tint(.white)
+                    }
                     Rectangle().strokeBorder(.white.opacity(0.5), lineWidth: 2).padding(30)
                     ForEach(Array(s.points.enumerated()), id: \.offset) { i, pt in
                         Circle().strokeBorder(.white, lineWidth: 2)
@@ -257,8 +202,7 @@ struct ContentView: View {
                             .overlay(alignment: .top) {
                                 Text("P\(i+1)").font(.system(size:9)).foregroundColor(.white)
                                     .padding(.horizontal,3).padding(.vertical,1)
-                                    .background(.black.opacity(0.7)).cornerRadius(4)
-                                    .offset(y: -14)
+                                    .background(.black.opacity(0.7)).cornerRadius(4).offset(y: -14)
                             }
                             .position(x: pt.x * geo.size.width, y: pt.y * geo.size.height)
                     }
@@ -269,7 +213,7 @@ struct ContentView: View {
                     }
                 }
                 .onTapGesture { loc in
-                    s.add(loc.x / geo.size.width, loc.y / geo.size.height, cam)
+                    s.add(loc.x / geo.size.width, loc.y / geo.size.height)
                 }
                 .onAppear { geoW = geo.size.width }
             }
@@ -281,7 +225,6 @@ struct ContentView: View {
                     ParamBadge("ISO", "\(s.filmISO)")
                     ParamBadge("📷", "1/\(Int(1/max(0.001,cam.exposureSeconds))) ISO\(Int(cam.iso))")
                 }
-
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
                         ForEach(Array(ZONES.enumerated()), id:\.offset) { i,z in
@@ -299,27 +242,24 @@ struct ContentView: View {
                         ForEach(Array(s.offsets.enumerated()), id:\.offset) { i,o in
                             let ez = o + s.shift
                             let sn = max(0, min(10, round(5+ez)))
-                            let x = (sn + 0.5) / 11 * geoW
                             Text("P\(i+1)").font(.system(size:8,weight:.bold))
                                 .foregroundColor(.black).padding(.horizontal,5).padding(.vertical,2)
                                 .background(Capsule().fill(.orange))
-                                .position(x: x, y: 17)
+                                .position(x: (sn + 0.5) / 11 * geoW, y: 17)
                         }
                     }.frame(height:34).cornerRadius(6)
                     .gesture(DragGesture().onChanged { g in
-                        s.shift += g.translation.width * (10 / max(1, geoW))
+                        s.shift = s.clamp(s.shift + g.translation.width * (10 / max(1, geoW)))
                     })
                     Text(s.points.isEmpty ? "点击画面测光" : "拖动轨道")
                         .font(.system(size:10)).foregroundColor(.orange)
                 }
-
                 HStack {
                     Text("快门").font(.caption).foregroundColor(.gray)
                     Text(s.shutter).font(.system(size:34,weight:.bold,design:.monospaced)).foregroundColor(.orange)
                     if !s.comp.isEmpty { Text(s.comp).font(.caption2).foregroundColor(.gray) }
                     Spacer()
                 }.padding(.vertical, 2)
-
                 HStack(spacing: 6) {
                     ToolBtn("✕", "清除") { s.clear() }
                     ToolBtn("↩", "撤销") { s.removeLast() }
@@ -369,4 +309,3 @@ struct CamPreview: UIViewRepresentable {
         var pl: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
     }
 }
-
